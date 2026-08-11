@@ -39,7 +39,9 @@ API docs: [http://localhost:8020/docs](http://localhost:8020/docs)
 | Local JWT auth register/login/me | Done |
 | Org bootstrap (funeral_home / crematory admin) | Done |
 | Create/list/get cases (test + live QR/PIN) | Done |
-| Crematory claim / steps / family / billing | Later phases |
+| Record process steps (custody-gated) | Done |
+| Crematory claim via PIN/QR | Done |
+| Family public / billing / push | Later phases |
 | Supabase Auth swap | When CT Supabase project is ready |
 
 ### Auth note

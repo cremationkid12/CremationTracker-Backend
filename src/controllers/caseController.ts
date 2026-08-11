@@ -1,10 +1,34 @@
 import type { Response } from "express";
 import type { AuthenticatedRequest } from "../auth/authMiddleware";
-import type { CaseMode, CaseService, CaseStatus } from "../services/caseService";
+import {
+  CaseServiceError,
+  type CaseMode,
+  type CaseService,
+  type CaseStatus,
+} from "../services/caseService";
 
 export type CaseControllerDeps = {
   caseService: CaseService;
 };
+
+function mapServiceError(res: Response, error: unknown): void {
+  if (error instanceof CaseServiceError) {
+    const status =
+      error.code === "not_found"
+        ? 404
+        : error.code === "forbidden"
+          ? 403
+          : error.code === "conflict"
+            ? 409
+            : 400;
+    res.status(status).json({ error: error.code, message: error.message });
+    return;
+  }
+  res.status(400).json({
+    error: "request_failed",
+    message: error instanceof Error ? error.message : "Request failed.",
+  });
+}
 
 export async function listCases(
   req: AuthenticatedRequest,
@@ -17,7 +41,8 @@ export async function listCases(
   }
 
   const status =
-    typeof req.query.status === "string" && ["active", "completed", "archived"].includes(req.query.status)
+    typeof req.query.status === "string" &&
+    ["active", "completed", "archived"].includes(req.query.status)
       ? (req.query.status as CaseStatus)
       : undefined;
   const caseMode =
@@ -25,7 +50,10 @@ export async function listCases(
       ? (req.query.case_mode as CaseMode)
       : undefined;
 
-  const result = await deps.caseService.listCases(req.auth.orgId, { status, caseMode });
+  const result = await deps.caseService.listCases(req.auth.orgId, req.auth.orgType, {
+    status,
+    caseMode,
+  });
   res.status(200).json(result);
 }
 
@@ -74,10 +102,7 @@ export async function createCase(
     });
     res.status(201).json(created);
   } catch (error) {
-    res.status(400).json({
-      error: "create_failed",
-      message: error instanceof Error ? error.message : "Could not create case.",
-    });
+    mapServiceError(res, error);
   }
 }
 
@@ -96,10 +121,85 @@ export async function getCase(
     return;
   }
 
-  const detail = await deps.caseService.getCase(req.auth.orgId, caseId);
+  const detail = await deps.caseService.getCase(req.auth.orgId, req.auth.orgType, caseId);
   if (!detail) {
     res.status(404).json({ error: "not_found", message: "Case not found." });
     return;
   }
   res.status(200).json(detail);
+}
+
+export async function postCaseStep(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps: CaseControllerDeps,
+): Promise<void> {
+  if (!req.auth) {
+    res.status(401).json({ error: "unauthorized", message: "Authentication is required." });
+    return;
+  }
+  const caseId = typeof req.params.caseId === "string" ? req.params.caseId : "";
+  const stepCode = typeof req.body?.step_code === "string" ? req.body.step_code.trim() : "";
+  const note = typeof req.body?.note === "string" ? req.body.note : undefined;
+  if (!caseId || !stepCode) {
+    res.status(400).json({
+      error: "bad_request",
+      message: "caseId and step_code are required.",
+    });
+    return;
+  }
+
+  try {
+    const detail = await deps.caseService.recordStep({
+      orgId: req.auth.orgId,
+      orgType: req.auth.orgType,
+      userId: req.auth.userId,
+      caseId,
+      stepCode,
+      note,
+    });
+    res.status(201).json(detail);
+  } catch (error) {
+    mapServiceError(res, error);
+  }
+}
+
+export async function claimCase(
+  req: AuthenticatedRequest,
+  res: Response,
+  deps: CaseControllerDeps,
+): Promise<void> {
+  if (!req.auth) {
+    res.status(401).json({ error: "unauthorized", message: "Authentication is required." });
+    return;
+  }
+  if (req.auth.orgType !== "crematory") {
+    res.status(403).json({
+      error: "forbidden",
+      message: "Only crematories can claim cases.",
+    });
+    return;
+  }
+
+  const qrToken = typeof req.body?.qr_token === "string" ? req.body.qr_token.trim() : undefined;
+  const pin = typeof req.body?.pin === "string" ? req.body.pin.trim() : undefined;
+  if (!qrToken && !pin) {
+    res.status(400).json({
+      error: "bad_request",
+      message: "qr_token or pin is required.",
+    });
+    return;
+  }
+
+  try {
+    const detail = await deps.caseService.claimCase({
+      crematoryOrgId: req.auth.orgId,
+      userId: req.auth.userId,
+      qrToken,
+      pin,
+    });
+    res.status(200).json(detail);
+  } catch (error) {
+    mapServiceError(res, error);
+  }
 }

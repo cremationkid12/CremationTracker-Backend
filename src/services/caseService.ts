@@ -1,7 +1,14 @@
 import { randomBytes, randomInt, randomUUID } from "node:crypto";
 import { getPgPool, hasDatabase } from "../db/pool";
+import type { OrgType } from "../types/domain";
 import { sha256Hex } from "./authService";
 import type { createMemoryOrgService } from "./orgService";
+import {
+  getStepDef,
+  INITIAL_STEP,
+  listAvailableNextSteps,
+  type StepDef,
+} from "./stepCatalog";
 
 export type CaseMode = "test" | "live";
 export type CaseStatus = "active" | "completed" | "archived";
@@ -29,7 +36,6 @@ export type CaseRecord = {
   created_by_user_id: string;
   created_at: string;
   updated_at: string;
-  /** Hashed secrets — never expose */
   qr_token_hash: string | null;
   pin_hash: string | null;
 };
@@ -45,8 +51,9 @@ export type CaseDetail = {
   billing_status: string | null;
   created_at: string;
   current_step_label: string | null;
+  current_step_code: string | null;
   steps: CaseStep[];
-  /** Returned only on live create to funeral home */
+  available_next_steps: Array<{ code: string; label: string }>;
   qr_payload?: string | null;
   pin?: string | null;
 };
@@ -68,21 +75,45 @@ export type CreateCaseInput = {
   intake?: Record<string, unknown>;
 };
 
+export type RecordStepInput = {
+  orgId: string;
+  orgType: OrgType;
+  userId: string;
+  caseId: string;
+  stepCode: string;
+  note?: string;
+};
+
+export type ClaimCaseInput = {
+  crematoryOrgId: string;
+  userId: string;
+  qrToken?: string;
+  pin?: string;
+};
+
+export class CaseServiceError extends Error {
+  constructor(
+    message: string,
+    readonly code: "forbidden" | "not_found" | "bad_request" | "conflict" = "bad_request",
+  ) {
+    super(message);
+    this.name = "CaseServiceError";
+  }
+}
+
 export type CaseService = {
   createCase: (input: CreateCaseInput) => Promise<CaseDetail>;
   listCases: (
     orgId: string,
+    orgType: OrgType,
     opts?: { status?: CaseStatus; caseMode?: CaseMode },
   ) => Promise<{ cases: CaseSummary[]; active_count: number }>;
-  getCase: (orgId: string, caseId: string) => Promise<CaseDetail | null>;
+  getCase: (orgId: string, orgType: OrgType, caseId: string) => Promise<CaseDetail | null>;
+  recordStep: (input: RecordStepInput) => Promise<CaseDetail>;
+  claimCase: (input: ClaimCaseInput) => Promise<CaseDetail>;
 };
 
 type MemoryOrgService = ReturnType<typeof createMemoryOrgService>;
-
-const INITIAL_STEP = {
-  code: "received_into_care",
-  label: "Received into care of funeral home",
-};
 
 function generatePin(): string {
   return String(randomInt(100000, 999999));
@@ -92,15 +123,80 @@ function generateQrToken(): string {
   return randomBytes(24).toString("base64url");
 }
 
+function toAvailable(steps: StepDef[]): Array<{ code: string; label: string }> {
+  return steps.map((s) => ({ code: s.code, label: s.label }));
+}
+
+function buildDetail(args: {
+  record: CaseRecord;
+  caseSteps: CaseStep[];
+  viewerOrgId: string;
+  viewerOrgType: OrgType;
+  extras?: { qr_payload?: string | null; pin?: string | null };
+}): CaseDetail {
+  const { record, caseSteps, viewerOrgId, viewerOrgType, extras } = args;
+  const last = caseSteps[caseSteps.length - 1];
+  const isOwner = record.owner_org_id === viewerOrgId;
+  const custodyIsViewer = record.custody_org_id === viewerOrgId;
+  const custodyOrgType: OrgType = custodyIsViewer
+    ? viewerOrgType
+    : isOwner
+      ? "funeral_home"
+      : "crematory";
+
+  // When owner still has custody, custody type is funeral_home; after claim, crematory.
+  let resolvedCustodyType: OrgType = "funeral_home";
+  if (record.custody_org_id && record.custody_org_id !== record.owner_org_id) {
+    resolvedCustodyType = "crematory";
+  }
+  if (custodyIsViewer) resolvedCustodyType = viewerOrgType;
+
+  const available = listAvailableNextSteps(
+    last?.step_code ?? null,
+    viewerOrgType,
+    resolvedCustodyType,
+  );
+
+  return {
+    id: record.id,
+    owner_org_id: record.owner_org_id,
+    custody_org_id: record.custody_org_id,
+    case_mode: record.case_mode,
+    status: record.status,
+    decedent_display_name: record.decedent_display_name,
+    intake: isOwner ? record.intake : {},
+    billing_status: isOwner ? record.billing_status : null,
+    created_at: record.created_at,
+    current_step_label: last?.step_label ?? null,
+    current_step_code: last?.step_code ?? null,
+    steps: caseSteps,
+    available_next_steps: record.status === "active" ? toAvailable(available) : [],
+    qr_payload: extras?.qr_payload ?? null,
+    pin: extras?.pin ?? null,
+  };
+}
+
 export function createMemoryCaseService(orgService: MemoryOrgService): CaseService {
   const cases = new Map<string, CaseRecord>();
   const steps = new Map<string, CaseStep[]>();
+
+  async function detailFor(orgId: string, orgType: OrgType, caseId: string): Promise<CaseDetail | null> {
+    const record = cases.get(caseId);
+    if (!record) return null;
+    if (record.owner_org_id !== orgId && record.custody_org_id !== orgId) return null;
+    return buildDetail({
+      record,
+      caseSteps: steps.get(caseId) ?? [],
+      viewerOrgId: orgId,
+      viewerOrgType: orgType,
+    });
+  }
 
   return {
     async createCase(input) {
       const org = await orgService.getOrganization(input.ownerOrgId);
       if (!org || org.org_type !== "funeral_home") {
-        throw new Error("Only funeral homes can create cases.");
+        throw new CaseServiceError("Only funeral homes can create cases.", "forbidden");
       }
 
       let billingStatus: string | null = "not_required";
@@ -118,7 +214,6 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
           credits.free_live_cases_remaining -= 1;
           billingStatus = "free_credit";
         } else {
-          // Phase 4 wires Stripe; for Phase 1 still allow creation and mark pending payment path later.
           billingStatus = "pending";
         }
         credits.live_cases_created += 1;
@@ -161,71 +256,214 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
       };
       steps.set(id, [step]);
 
-      return {
-        id: record.id,
-        owner_org_id: record.owner_org_id,
-        custody_org_id: record.custody_org_id,
-        case_mode: record.case_mode,
-        status: record.status,
-        decedent_display_name: record.decedent_display_name,
-        intake: record.intake,
-        billing_status: record.billing_status,
-        created_at: record.created_at,
-        current_step_label: step.step_label,
-        steps: [step],
-        qr_payload: qrPayload,
-        pin,
-      };
+      return buildDetail({
+        record,
+        caseSteps: [step],
+        viewerOrgId: input.ownerOrgId,
+        viewerOrgType: "funeral_home",
+        extras: { qr_payload: qrPayload, pin },
+      });
     },
 
-    async listCases(orgId, opts) {
-      const all = [...cases.values()].filter((c) => c.owner_org_id === orgId);
+    async listCases(orgId, orgType, opts) {
+      const all = [...cases.values()].filter((c) =>
+        orgType === "funeral_home"
+          ? c.owner_org_id === orgId
+          : c.custody_org_id === orgId && c.custody_org_id !== c.owner_org_id,
+      );
       const active_count = all.filter((c) => c.status === "active").length;
       let filtered = all;
       if (opts?.status) filtered = filtered.filter((c) => c.status === opts.status);
       if (opts?.caseMode) filtered = filtered.filter((c) => c.case_mode === opts.caseMode);
       filtered.sort((a, b) => b.created_at.localeCompare(a.created_at));
 
-      const summaries: CaseSummary[] = filtered.map((c) => {
-        const caseSteps = steps.get(c.id) ?? [];
-        const last = caseSteps[caseSteps.length - 1];
-        return {
-          id: c.id,
-          case_mode: c.case_mode,
-          status: c.status,
-          decedent_display_name: c.decedent_display_name,
-          current_step_label: last?.step_label ?? null,
-          created_at: c.created_at,
-        };
-      });
-      return { cases: summaries, active_count };
+      return {
+        active_count,
+        cases: filtered.map((c) => {
+          const caseSteps = steps.get(c.id) ?? [];
+          const last = caseSteps[caseSteps.length - 1];
+          return {
+            id: c.id,
+            case_mode: c.case_mode,
+            status: c.status,
+            decedent_display_name: c.decedent_display_name,
+            current_step_label: last?.step_label ?? null,
+            created_at: c.created_at,
+          };
+        }),
+      };
     },
 
-    async getCase(orgId, caseId) {
-      const record = cases.get(caseId);
-      if (!record) return null;
-      if (record.owner_org_id !== orgId && record.custody_org_id !== orgId) return null;
-      const caseSteps = steps.get(caseId) ?? [];
+    async getCase(orgId, orgType, caseId) {
+      return detailFor(orgId, orgType, caseId);
+    },
+
+    async recordStep(input) {
+      const record = cases.get(input.caseId);
+      if (!record) throw new CaseServiceError("Case not found.", "not_found");
+      if (record.owner_org_id !== input.orgId && record.custody_org_id !== input.orgId) {
+        throw new CaseServiceError("Case not found.", "not_found");
+      }
+      if (record.status !== "active") {
+        throw new CaseServiceError("Case is not active.", "conflict");
+      }
+      if (record.custody_org_id !== input.orgId) {
+        throw new CaseServiceError("Only the org with custody can record steps.", "forbidden");
+      }
+
+      const def = getStepDef(input.stepCode);
+      if (!def) throw new CaseServiceError("Unknown step_code.", "bad_request");
+
+      const caseSteps = steps.get(input.caseId) ?? [];
       const last = caseSteps[caseSteps.length - 1];
-      const isOwner = record.owner_org_id === orgId;
-      return {
-        id: record.id,
-        owner_org_id: record.owner_org_id,
-        custody_org_id: record.custody_org_id,
-        case_mode: record.case_mode,
-        status: record.status,
-        decedent_display_name: record.decedent_display_name,
-        intake: isOwner ? record.intake : {},
-        billing_status: isOwner ? record.billing_status : null,
-        created_at: record.created_at,
-        current_step_label: last?.step_label ?? null,
-        steps: caseSteps,
+      const custodyType: OrgType =
+        record.custody_org_id === record.owner_org_id ? "funeral_home" : "crematory";
+      const available = listAvailableNextSteps(last?.step_code ?? null, input.orgType, custodyType);
+      if (!available.some((s) => s.code === input.stepCode)) {
+        throw new CaseServiceError(
+          `Step "${input.stepCode}" is not available from current step.`,
+          "bad_request",
+        );
+      }
+
+      const now = new Date().toISOString();
+      const step: CaseStep = {
+        id: randomUUID(),
+        case_id: input.caseId,
+        step_code: def.code,
+        step_label: def.label,
+        actor_org_id: input.orgId,
+        actor_user_id: input.userId,
+        note: input.note?.trim() || null,
+        recorded_at: now,
       };
+      caseSteps.push(step);
+      steps.set(input.caseId, caseSteps);
+      record.updated_at = now;
+
+      if (def.completesCase) {
+        record.status = "archived";
+        record.updated_at = now;
+      }
+
+      return buildDetail({
+        record,
+        caseSteps,
+        viewerOrgId: input.orgId,
+        viewerOrgType: input.orgType,
+      });
+    },
+
+    async claimCase(input) {
+      const qrHash = input.qrToken ? sha256Hex(input.qrToken.trim()) : null;
+      const pinHash = input.pin ? sha256Hex(input.pin.trim()) : null;
+      if (!qrHash && !pinHash) {
+        throw new CaseServiceError("qr_token or pin is required.", "bad_request");
+      }
+
+      const record = [...cases.values()].find((c) => {
+        if (c.case_mode !== "live" || c.status !== "active") return false;
+        if (qrHash && c.qr_token_hash === qrHash) return true;
+        if (pinHash && c.pin_hash === pinHash) return true;
+        return false;
+      });
+      if (!record) throw new CaseServiceError("No matching live case found.", "not_found");
+
+      if (record.custody_org_id !== record.owner_org_id) {
+        if (record.custody_org_id === input.crematoryOrgId) {
+          return detailFor(input.crematoryOrgId, "crematory", record.id) as Promise<CaseDetail>;
+        }
+        throw new CaseServiceError("Case already claimed by another crematory.", "conflict");
+      }
+
+      const now = new Date().toISOString();
+      record.custody_org_id = input.crematoryOrgId;
+      record.updated_at = now;
+
+      const caseSteps = steps.get(record.id) ?? [];
+      const last = caseSteps[caseSteps.length - 1];
+
+      // Auto-fill drop-off if FH had not recorded it yet.
+      if (last?.step_code === "transported_to_crematory") {
+        caseSteps.push({
+          id: randomUUID(),
+          case_id: record.id,
+          step_code: "dropped_off_at_crematory",
+          step_label: getStepDef("dropped_off_at_crematory")!.label,
+          actor_org_id: record.owner_org_id,
+          actor_user_id: null,
+          note: "Auto-recorded on crematory claim",
+          recorded_at: now,
+        });
+      } else if (
+        last &&
+        last.step_code !== "dropped_off_at_crematory" &&
+        last.step_code !== "custody_accepted"
+      ) {
+        // Allow claim once transport has started or later FH steps; still accept from earlier for pilot.
+        // Soft path: append drop-off then custody.
+        if (getStepDef(last.step_code)) {
+          caseSteps.push({
+            id: randomUUID(),
+            case_id: record.id,
+            step_code: "dropped_off_at_crematory",
+            step_label: getStepDef("dropped_off_at_crematory")!.label,
+            actor_org_id: record.owner_org_id,
+            actor_user_id: null,
+            note: "Auto-recorded on crematory claim",
+            recorded_at: now,
+          });
+        }
+      }
+
+      if (caseSteps[caseSteps.length - 1]?.step_code !== "custody_accepted") {
+        caseSteps.push({
+          id: randomUUID(),
+          case_id: record.id,
+          step_code: "custody_accepted",
+          step_label: getStepDef("custody_accepted")!.label,
+          actor_org_id: input.crematoryOrgId,
+          actor_user_id: input.userId,
+          note: null,
+          recorded_at: now,
+        });
+      }
+      steps.set(record.id, caseSteps);
+
+      return buildDetail({
+        record,
+        caseSteps,
+        viewerOrgId: input.crematoryOrgId,
+        viewerOrgType: "crematory",
+      });
     },
   };
 }
 
 function createPgCaseService(): CaseService {
+  async function loadSteps(caseId: string): Promise<CaseStep[]> {
+    const pool = getPgPool();
+    const stepResult = await pool.query<CaseStep>(
+      `SELECT id, case_id, step_code, step_label, actor_org_id, actor_user_id, note,
+              recorded_at::text
+       FROM case_steps WHERE case_id = $1 ORDER BY recorded_at ASC`,
+      [caseId],
+    );
+    return stepResult.rows;
+  }
+
+  async function loadRecord(caseId: string): Promise<CaseRecord | null> {
+    const pool = getPgPool();
+    const result = await pool.query<CaseRecord>(
+      `SELECT id, owner_org_id, custody_org_id, case_mode, status, decedent_display_name,
+              intake, billing_status, created_by_user_id, created_at::text, updated_at::text,
+              qr_token_hash, pin_hash
+       FROM cases WHERE id = $1`,
+      [caseId],
+    );
+    return result.rows[0] ?? null;
+  }
+
   return {
     async createCase(input) {
       const pool = getPgPool();
@@ -234,7 +472,7 @@ function createPgCaseService(): CaseService {
         [input.ownerOrgId],
       );
       if (!orgResult.rows[0] || orgResult.rows[0].org_type !== "funeral_home") {
-        throw new Error("Only funeral homes can create cases.");
+        throw new CaseServiceError("Only funeral homes can create cases.", "forbidden");
       }
 
       let billingStatus: string | null = "not_required";
@@ -288,24 +526,15 @@ function createPgCaseService(): CaseService {
         }
 
         const id = randomUUID();
-        const insert = await client.query<{
-          id: string;
-          owner_org_id: string;
-          custody_org_id: string | null;
-          case_mode: CaseMode;
-          status: CaseStatus;
-          decedent_display_name: string;
-          intake: Record<string, unknown>;
-          billing_status: string | null;
-          created_at: string;
-        }>(
+        const insert = await client.query<CaseRecord>(
           `INSERT INTO cases (
              id, owner_org_id, custody_org_id, case_mode, status,
              decedent_display_name, intake, qr_token_hash, pin_hash,
              billing_status, created_by_user_id
            ) VALUES ($1,$2,$2,$3,'active',$4,$5::jsonb,$6,$7,$8,$9)
            RETURNING id, owner_org_id, custody_org_id, case_mode, status,
-                     decedent_display_name, intake, billing_status, created_at::text`,
+                     decedent_display_name, intake, billing_status, created_by_user_id,
+                     created_at::text, updated_at::text, qr_token_hash, pin_hash`,
           [
             id,
             input.ownerOrgId,
@@ -320,12 +549,10 @@ function createPgCaseService(): CaseService {
         );
 
         const stepId = randomUUID();
-        const stepResult = await client.query<CaseStep>(
+        await client.query(
           `INSERT INTO case_steps (
              id, case_id, step_code, step_label, actor_org_id, actor_user_id
-           ) VALUES ($1,$2,$3,$4,$5,$6)
-           RETURNING id, case_id, step_code, step_label, actor_org_id, actor_user_id, note,
-                     recorded_at::text`,
+           ) VALUES ($1,$2,$3,$4,$5,$6)`,
           [
             stepId,
             id,
@@ -337,23 +564,15 @@ function createPgCaseService(): CaseService {
         );
 
         await client.query("COMMIT");
-        const row = insert.rows[0];
-        const step = stepResult.rows[0];
-        return {
-          id: row.id,
-          owner_org_id: row.owner_org_id,
-          custody_org_id: row.custody_org_id,
-          case_mode: row.case_mode,
-          status: row.status,
-          decedent_display_name: row.decedent_display_name,
-          intake: row.intake,
-          billing_status: row.billing_status,
-          created_at: row.created_at,
-          current_step_label: step.step_label,
-          steps: [step],
-          qr_payload: qrPayload,
-          pin,
-        };
+        const record = insert.rows[0];
+        const caseSteps = await loadSteps(id);
+        return buildDetail({
+          record,
+          caseSteps,
+          viewerOrgId: input.ownerOrgId,
+          viewerOrgType: "funeral_home",
+          extras: { qr_payload: qrPayload, pin },
+        });
       } catch (error) {
         await client.query("ROLLBACK");
         throw error;
@@ -362,10 +581,13 @@ function createPgCaseService(): CaseService {
       }
     },
 
-    async listCases(orgId, opts) {
+    async listCases(orgId, orgType, opts) {
       const pool = getPgPool();
       const params: unknown[] = [orgId];
-      const filters = ["owner_org_id = $1"];
+      const filters: string[] =
+        orgType === "funeral_home"
+          ? ["owner_org_id = $1"]
+          : ["custody_org_id = $1", "custody_org_id IS DISTINCT FROM owner_org_id"];
       if (opts?.status) {
         params.push(opts.status);
         filters.push(`status = $${params.length}`);
@@ -395,11 +617,13 @@ function createPgCaseService(): CaseService {
         params,
       );
 
-      const countResult = await pool.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM cases
-         WHERE owner_org_id = $1 AND status = 'active'`,
-        [orgId],
-      );
+      const countSql =
+        orgType === "funeral_home"
+          ? `SELECT COUNT(*)::text AS count FROM cases WHERE owner_org_id = $1 AND status = 'active'`
+          : `SELECT COUNT(*)::text AS count FROM cases
+             WHERE custody_org_id = $1 AND custody_org_id IS DISTINCT FROM owner_org_id
+               AND status = 'active'`;
+      const countResult = await pool.query<{ count: string }>(countSql, [orgId]);
 
       return {
         cases: list.rows.map((row) => ({
@@ -414,50 +638,183 @@ function createPgCaseService(): CaseService {
       };
     },
 
-    async getCase(orgId, caseId) {
-      const pool = getPgPool();
-      const caseResult = await pool.query<{
-        id: string;
-        owner_org_id: string;
-        custody_org_id: string | null;
-        case_mode: CaseMode;
-        status: CaseStatus;
-        decedent_display_name: string;
-        intake: Record<string, unknown>;
-        billing_status: string | null;
-        created_at: string;
-      }>(
-        `SELECT id, owner_org_id, custody_org_id, case_mode, status,
-                decedent_display_name, intake, billing_status, created_at::text
-         FROM cases
-         WHERE id = $1 AND (owner_org_id = $2 OR custody_org_id = $2)`,
-        [caseId, orgId],
-      );
-      const record = caseResult.rows[0];
+    async getCase(orgId, orgType, caseId) {
+      const record = await loadRecord(caseId);
       if (!record) return null;
+      if (record.owner_org_id !== orgId && record.custody_org_id !== orgId) return null;
+      const caseSteps = await loadSteps(caseId);
+      return buildDetail({ record, caseSteps, viewerOrgId: orgId, viewerOrgType: orgType });
+    },
 
-      const stepResult = await pool.query<CaseStep>(
-        `SELECT id, case_id, step_code, step_label, actor_org_id, actor_user_id, note,
-                recorded_at::text
-         FROM case_steps WHERE case_id = $1 ORDER BY recorded_at ASC`,
-        [caseId],
-      );
-      const caseSteps = stepResult.rows;
+    async recordStep(input) {
+      const pool = getPgPool();
+      const record = await loadRecord(input.caseId);
+      if (!record || (record.owner_org_id !== input.orgId && record.custody_org_id !== input.orgId)) {
+        throw new CaseServiceError("Case not found.", "not_found");
+      }
+      if (record.status !== "active") {
+        throw new CaseServiceError("Case is not active.", "conflict");
+      }
+      if (record.custody_org_id !== input.orgId) {
+        throw new CaseServiceError("Only the org with custody can record steps.", "forbidden");
+      }
+
+      const def = getStepDef(input.stepCode);
+      if (!def) throw new CaseServiceError("Unknown step_code.", "bad_request");
+
+      const caseSteps = await loadSteps(input.caseId);
       const last = caseSteps[caseSteps.length - 1];
-      const isOwner = record.owner_org_id === orgId;
-      return {
-        id: record.id,
-        owner_org_id: record.owner_org_id,
-        custody_org_id: record.custody_org_id,
-        case_mode: record.case_mode,
-        status: record.status,
-        decedent_display_name: record.decedent_display_name,
-        intake: isOwner ? record.intake : {},
-        billing_status: isOwner ? record.billing_status : null,
-        created_at: record.created_at,
-        current_step_label: last?.step_label ?? null,
-        steps: caseSteps,
-      };
+      const custodyType: OrgType =
+        record.custody_org_id === record.owner_org_id ? "funeral_home" : "crematory";
+      const available = listAvailableNextSteps(last?.step_code ?? null, input.orgType, custodyType);
+      if (!available.some((s) => s.code === input.stepCode)) {
+        throw new CaseServiceError(
+          `Step "${input.stepCode}" is not available from current step.`,
+          "bad_request",
+        );
+      }
+
+      const stepId = randomUUID();
+      await pool.query(
+        `INSERT INTO case_steps (
+           id, case_id, step_code, step_label, actor_org_id, actor_user_id, note
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          stepId,
+          input.caseId,
+          def.code,
+          def.label,
+          input.orgId,
+          input.userId,
+          input.note?.trim() || null,
+        ],
+      );
+
+      if (def.completesCase) {
+        await pool.query(
+          `UPDATE cases SET status = 'archived', completed_at = NOW(), archived_at = NOW(),
+           updated_at = NOW() WHERE id = $1`,
+          [input.caseId],
+        );
+      } else {
+        await pool.query(`UPDATE cases SET updated_at = NOW() WHERE id = $1`, [input.caseId]);
+      }
+
+      const updated = await loadRecord(input.caseId);
+      const updatedSteps = await loadSteps(input.caseId);
+      return buildDetail({
+        record: updated!,
+        caseSteps: updatedSteps,
+        viewerOrgId: input.orgId,
+        viewerOrgType: input.orgType,
+      });
+    },
+
+    async claimCase(input) {
+      const pool = getPgPool();
+      const qrHash = input.qrToken ? sha256Hex(input.qrToken.trim()) : null;
+      const pinHash = input.pin ? sha256Hex(input.pin.trim()) : null;
+      if (!qrHash && !pinHash) {
+        throw new CaseServiceError("qr_token or pin is required.", "bad_request");
+      }
+
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const found = await client.query<CaseRecord>(
+          `SELECT id, owner_org_id, custody_org_id, case_mode, status, decedent_display_name,
+                  intake, billing_status, created_by_user_id, created_at::text, updated_at::text,
+                  qr_token_hash, pin_hash
+           FROM cases
+           WHERE case_mode = 'live' AND status = 'active'
+             AND (
+               ($1::text IS NOT NULL AND qr_token_hash = $1)
+               OR ($2::text IS NOT NULL AND pin_hash = $2)
+             )
+           FOR UPDATE`,
+          [qrHash, pinHash],
+        );
+        const record = found.rows[0];
+        if (!record) {
+          throw new CaseServiceError("No matching live case found.", "not_found");
+        }
+
+        if (record.custody_org_id !== record.owner_org_id) {
+          if (record.custody_org_id === input.crematoryOrgId) {
+            await client.query("COMMIT");
+            const caseSteps = await loadSteps(record.id);
+            return buildDetail({
+              record,
+              caseSteps,
+              viewerOrgId: input.crematoryOrgId,
+              viewerOrgType: "crematory",
+            });
+          }
+          throw new CaseServiceError("Case already claimed by another crematory.", "conflict");
+        }
+
+        await client.query(
+          `UPDATE cases SET custody_org_id = $2, updated_at = NOW() WHERE id = $1`,
+          [record.id, input.crematoryOrgId],
+        );
+
+        const existing = await client.query<{ step_code: string }>(
+          `SELECT step_code FROM case_steps WHERE case_id = $1 ORDER BY recorded_at DESC LIMIT 1`,
+          [record.id],
+        );
+        const lastCode = existing.rows[0]?.step_code;
+
+        if (lastCode !== "dropped_off_at_crematory" && lastCode !== "custody_accepted") {
+          await client.query(
+            `INSERT INTO case_steps (
+               id, case_id, step_code, step_label, actor_org_id, actor_user_id, note
+             ) VALUES ($1,$2,$3,$4,$5,NULL,$6)`,
+            [
+              randomUUID(),
+              record.id,
+              "dropped_off_at_crematory",
+              getStepDef("dropped_off_at_crematory")!.label,
+              record.owner_org_id,
+              "Auto-recorded on crematory claim",
+            ],
+          );
+        }
+
+        const afterDrop = await client.query<{ step_code: string }>(
+          `SELECT step_code FROM case_steps WHERE case_id = $1 ORDER BY recorded_at DESC LIMIT 1`,
+          [record.id],
+        );
+        if (afterDrop.rows[0]?.step_code !== "custody_accepted") {
+          await client.query(
+            `INSERT INTO case_steps (
+               id, case_id, step_code, step_label, actor_org_id, actor_user_id
+             ) VALUES ($1,$2,$3,$4,$5,$6)`,
+            [
+              randomUUID(),
+              record.id,
+              "custody_accepted",
+              getStepDef("custody_accepted")!.label,
+              input.crematoryOrgId,
+              input.userId,
+            ],
+          );
+        }
+
+        await client.query("COMMIT");
+        const updated = await loadRecord(record.id);
+        const caseSteps = await loadSteps(record.id);
+        return buildDetail({
+          record: updated!,
+          caseSteps,
+          viewerOrgId: input.crematoryOrgId,
+          viewerOrgType: "crematory",
+        });
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
     },
   };
 }
