@@ -9,6 +9,7 @@ import {
   listAvailableNextSteps,
   type StepDef,
 } from "./stepCatalog";
+import { buildFamilyStatus, type FamilyStatusResponse } from "./familyStatus";
 
 export type CaseMode = "test" | "live";
 export type CaseStatus = "active" | "completed" | "archived";
@@ -54,8 +55,10 @@ export type CaseDetail = {
   current_step_code: string | null;
   steps: CaseStep[];
   available_next_steps: Array<{ code: string; label: string }>;
+  /** Owner funeral home only */
   qr_payload?: string | null;
   pin?: string | null;
+  family_token?: string | null;
 };
 
 export type CaseSummary = {
@@ -111,6 +114,10 @@ export type CaseService = {
   getCase: (orgId: string, orgType: OrgType, caseId: string) => Promise<CaseDetail | null>;
   recordStep: (input: RecordStepInput) => Promise<CaseDetail>;
   claimCase: (input: ClaimCaseInput) => Promise<CaseDetail>;
+  getFamilyStatusByPin: (pin: string) => Promise<import("./familyStatus").FamilyStatusResponse>;
+  getFamilyStatusByToken: (
+    token: string,
+  ) => Promise<import("./familyStatus").FamilyStatusResponse>;
 };
 
 type MemoryOrgService = ReturnType<typeof createMemoryOrgService>;
@@ -132,19 +139,13 @@ function buildDetail(args: {
   caseSteps: CaseStep[];
   viewerOrgId: string;
   viewerOrgType: OrgType;
-  extras?: { qr_payload?: string | null; pin?: string | null };
+  extras?: { qr_payload?: string | null; pin?: string | null; family_token?: string | null };
 }): CaseDetail {
   const { record, caseSteps, viewerOrgId, viewerOrgType, extras } = args;
   const last = caseSteps[caseSteps.length - 1];
   const isOwner = record.owner_org_id === viewerOrgId;
   const custodyIsViewer = record.custody_org_id === viewerOrgId;
-  const custodyOrgType: OrgType = custodyIsViewer
-    ? viewerOrgType
-    : isOwner
-      ? "funeral_home"
-      : "crematory";
 
-  // When owner still has custody, custody type is funeral_home; after claim, crematory.
   let resolvedCustodyType: OrgType = "funeral_home";
   if (record.custody_org_id && record.custody_org_id !== record.owner_org_id) {
     resolvedCustodyType = "crematory";
@@ -171,24 +172,45 @@ function buildDetail(args: {
     current_step_code: last?.step_code ?? null,
     steps: caseSteps,
     available_next_steps: record.status === "active" ? toAvailable(available) : [],
-    qr_payload: extras?.qr_payload ?? null,
-    pin: extras?.pin ?? null,
+    qr_payload: isOwner ? (extras?.qr_payload ?? null) : null,
+    pin: isOwner ? (extras?.pin ?? null) : null,
+    family_token: isOwner ? (extras?.family_token ?? null) : null,
   };
 }
 
 export function createMemoryCaseService(orgService: MemoryOrgService): CaseService {
   const cases = new Map<string, CaseRecord>();
   const steps = new Map<string, CaseStep[]>();
+  const secrets = new Map<
+    string,
+    { pin: string; qr_token: string; family_token: string }
+  >();
 
   async function detailFor(orgId: string, orgType: OrgType, caseId: string): Promise<CaseDetail | null> {
     const record = cases.get(caseId);
     if (!record) return null;
     if (record.owner_org_id !== orgId && record.custody_org_id !== orgId) return null;
+    const secret = secrets.get(caseId);
     return buildDetail({
       record,
       caseSteps: steps.get(caseId) ?? [],
       viewerOrgId: orgId,
       viewerOrgType: orgType,
+      extras: secret
+        ? { pin: secret.pin, qr_payload: secret.qr_token, family_token: secret.family_token }
+        : undefined,
+    });
+  }
+
+  async function familyStatusForCase(caseId: string): Promise<FamilyStatusResponse> {
+    const record = cases.get(caseId);
+    if (!record) throw new CaseServiceError("Case not found.", "not_found");
+    const org = await orgService.getOrganization(record.owner_org_id);
+    return buildFamilyStatus({
+      decedentDisplayName: record.decedent_display_name,
+      funeralHomeName: org?.name ?? "Funeral home",
+      status: record.status,
+      steps: steps.get(caseId) ?? [],
     });
   }
 
@@ -244,6 +266,12 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
       };
       cases.set(id, record);
 
+      let familyToken: string | null = null;
+      if (input.caseMode === "live" && pin && qrPayload) {
+        familyToken = randomBytes(24).toString("base64url");
+        secrets.set(id, { pin, qr_token: qrPayload, family_token: familyToken });
+      }
+
       const step: CaseStep = {
         id: randomUUID(),
         case_id: id,
@@ -261,7 +289,7 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
         caseSteps: [step],
         viewerOrgId: input.ownerOrgId,
         viewerOrgType: "funeral_home",
-        extras: { qr_payload: qrPayload, pin },
+        extras: { qr_payload: qrPayload, pin, family_token: familyToken },
       });
     },
 
@@ -437,6 +465,26 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
         viewerOrgType: "crematory",
       });
     },
+
+    async getFamilyStatusByPin(pin) {
+      const normalized = pin.trim();
+      for (const [caseId, secret] of secrets.entries()) {
+        if (secret.pin === normalized) {
+          return familyStatusForCase(caseId);
+        }
+      }
+      throw new CaseServiceError("No case found for that PIN.", "not_found");
+    },
+
+    async getFamilyStatusByToken(token) {
+      const normalized = token.trim();
+      for (const [caseId, secret] of secrets.entries()) {
+        if (secret.family_token === normalized) {
+          return familyStatusForCase(caseId);
+        }
+      }
+      throw new CaseServiceError("No case found for that link.", "not_found");
+    },
   };
 }
 
@@ -526,6 +574,7 @@ function createPgCaseService(): CaseService {
         }
 
         const id = randomUUID();
+        const familyToken = input.caseMode === "live" ? randomBytes(24).toString("base64url") : null;
         const insert = await client.query<CaseRecord>(
           `INSERT INTO cases (
              id, owner_org_id, custody_org_id, case_mode, status,
@@ -547,6 +596,19 @@ function createPgCaseService(): CaseService {
             input.createdByUserId,
           ],
         );
+
+        if (familyToken && pin && qrPayload) {
+          await client.query(
+            `INSERT INTO case_share_secrets (case_id, pin, qr_token, family_token)
+             VALUES ($1, $2, $3, $4)`,
+            [id, pin, qrPayload, familyToken],
+          );
+          await client.query(
+            `INSERT INTO family_access (id, case_id, access_token_hash)
+             VALUES ($1, $2, $3)`,
+            [randomUUID(), id, sha256Hex(familyToken)],
+          );
+        }
 
         const stepId = randomUUID();
         await client.query(
@@ -571,7 +633,7 @@ function createPgCaseService(): CaseService {
           caseSteps,
           viewerOrgId: input.ownerOrgId,
           viewerOrgType: "funeral_home",
-          extras: { qr_payload: qrPayload, pin },
+          extras: { qr_payload: qrPayload, pin, family_token: familyToken },
         });
       } catch (error) {
         await client.query("ROLLBACK");
@@ -643,7 +705,28 @@ function createPgCaseService(): CaseService {
       if (!record) return null;
       if (record.owner_org_id !== orgId && record.custody_org_id !== orgId) return null;
       const caseSteps = await loadSteps(caseId);
-      return buildDetail({ record, caseSteps, viewerOrgId: orgId, viewerOrgType: orgType });
+      let extras: { pin?: string; qr_payload?: string; family_token?: string } | undefined;
+      if (record.owner_org_id === orgId) {
+        const pool = getPgPool();
+        const secret = await pool.query<{ pin: string; qr_token: string; family_token: string }>(
+          `SELECT pin, qr_token, family_token FROM case_share_secrets WHERE case_id = $1`,
+          [caseId],
+        );
+        if (secret.rows[0]) {
+          extras = {
+            pin: secret.rows[0].pin,
+            qr_payload: secret.rows[0].qr_token,
+            family_token: secret.rows[0].family_token,
+          };
+        }
+      }
+      return buildDetail({
+        record,
+        caseSteps,
+        viewerOrgId: orgId,
+        viewerOrgType: orgType,
+        extras,
+      });
     },
 
     async recordStep(input) {
@@ -815,6 +898,65 @@ function createPgCaseService(): CaseService {
       } finally {
         client.release();
       }
+    },
+
+    async getFamilyStatusByPin(pin) {
+      const pool = getPgPool();
+      const found = await pool.query<{
+        case_id: string;
+        decedent_display_name: string;
+        status: string;
+        funeral_home_name: string;
+      }>(
+        `SELECT s.case_id, c.decedent_display_name, c.status, o.name AS funeral_home_name
+         FROM case_share_secrets s
+         JOIN cases c ON c.id = s.case_id
+         JOIN organizations o ON o.id = c.owner_org_id
+         WHERE s.pin = $1
+         LIMIT 1`,
+        [pin.trim()],
+      );
+      const row = found.rows[0];
+      if (!row) throw new CaseServiceError("No case found for that PIN.", "not_found");
+      const caseSteps = await loadSteps(row.case_id);
+      return buildFamilyStatus({
+        decedentDisplayName: row.decedent_display_name,
+        funeralHomeName: row.funeral_home_name,
+        status: row.status,
+        steps: caseSteps,
+      });
+    },
+
+    async getFamilyStatusByToken(token) {
+      const pool = getPgPool();
+      const found = await pool.query<{
+        case_id: string;
+        decedent_display_name: string;
+        status: string;
+        funeral_home_name: string;
+      }>(
+        `SELECT s.case_id, c.decedent_display_name, c.status, o.name AS funeral_home_name
+         FROM case_share_secrets s
+         JOIN cases c ON c.id = s.case_id
+         JOIN organizations o ON o.id = c.owner_org_id
+         WHERE s.family_token = $1
+         LIMIT 1`,
+        [token.trim()],
+      );
+      const row = found.rows[0];
+      if (!row) throw new CaseServiceError("No case found for that link.", "not_found");
+      await pool.query(
+        `UPDATE family_access SET last_accessed_at = NOW()
+         WHERE case_id = $1 AND revoked_at IS NULL`,
+        [row.case_id],
+      );
+      const caseSteps = await loadSteps(row.case_id);
+      return buildFamilyStatus({
+        decedentDisplayName: row.decedent_display_name,
+        funeralHomeName: row.funeral_home_name,
+        status: row.status,
+        steps: caseSteps,
+      });
     },
   };
 }
