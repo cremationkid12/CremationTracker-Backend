@@ -30,14 +30,21 @@ curl http://localhost:8020/v1/health
 
 API docs: [http://localhost:8020/docs](http://localhost:8020/docs)
 
-## Current status (scaffold)
+## Current status (Phase 1 in progress)
 
 | Area | Status |
 |------|--------|
 | Health + Swagger + OpenAPI contract | Done |
-| DB migration `001_init` (orgs, members, cases, steps, family_access, credits) | Done |
-| Auth / case / claim route handlers | Contract only — Phase 1 |
-| Billing / family public / push | Later phases |
+| DB migration `001_init` | Done |
+| Local JWT auth register/login/me | Done |
+| Org bootstrap (funeral_home / crematory admin) | Done |
+| Create/list/get cases (test + live QR/PIN) | Done |
+| Crematory claim / steps / family / billing | Later phases |
+| Supabase Auth swap | When CT Supabase project is ready |
+
+### Auth note
+
+Phase 1 uses **local JWT auth** (`JWT_SECRET`) so development can proceed before Supabase is provisioned. Set `DATABASE_URL` to persist orgs/cases in Postgres; without it, the API uses in-memory stores (fine for local smoke tests).
 
 ## Tests
 
