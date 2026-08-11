@@ -8,6 +8,12 @@ import {
   createMemoryCaseService,
   type CaseService,
 } from "./services/caseService";
+import { createDefaultInviteMailer, type InviteMailer } from "./services/inviteMailer";
+import {
+  createDefaultInviteService,
+  createMemoryInviteService,
+  type InviteService,
+} from "./services/inviteService";
 import {
   createDefaultOrgService,
   createMemoryOrgService,
@@ -20,6 +26,8 @@ export type AppDependencies = {
   authService?: AuthService;
   orgService?: OrgService;
   caseService?: CaseService;
+  inviteService?: InviteService;
+  inviteMailer?: InviteMailer;
 };
 
 export function createApp(deps: AppDependencies = {}): Express {
@@ -51,6 +59,11 @@ export function createApp(deps: AppDependencies = {}): Express {
   app.use(express.json({ limit: "1mb" }));
 
   const orgService = deps.orgService ?? createDefaultOrgService();
+  const inviteService =
+    deps.inviteService ??
+    (hasDatabase()
+      ? createDefaultInviteService(orgService)
+      : createMemoryInviteService(orgService as ReturnType<typeof createMemoryOrgService>));
   const caseService =
     deps.caseService ??
     (hasDatabase()
@@ -60,6 +73,8 @@ export function createApp(deps: AppDependencies = {}): Express {
     authService: deps.authService ?? createDefaultAuthService(),
     orgService,
     caseService,
+    inviteService,
+    inviteMailer: deps.inviteMailer ?? createDefaultInviteMailer(),
   };
 
   setupSwaggerUi(app);

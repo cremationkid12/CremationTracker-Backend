@@ -25,6 +25,85 @@ type JwtPayload = {
   full_name?: string;
 };
 
+async function resolveUserIdFromBearer(token: string): Promise<{
+  userId: string;
+  email: string;
+  name: string;
+} | null> {
+  const secret = process.env.JWT_SECRET?.trim();
+  const header = jwt.decode(token, { complete: true })?.header;
+  const alg = header?.alg;
+
+  if (alg === "HS256" && secret) {
+    const decoded = jwt.verify(token, secret) as JwtPayload;
+    if (!decoded.sub) return null;
+    return {
+      userId: decoded.sub,
+      email: decoded.email ?? "",
+      name: decoded.full_name ?? decoded.name ?? "",
+    };
+  }
+
+  const user = await getUserFromSupabaseAccessToken(token);
+  if (!user) return null;
+  return {
+    userId: user.id,
+    email: user.email ?? "",
+    name:
+      user.user_metadata?.full_name?.toString().trim() ||
+      user.user_metadata?.name?.toString().trim() ||
+      "",
+  };
+}
+
+/** Auth required, org membership optional (invite accept). */
+export function createRequireAuthUser(orgService: OrgService) {
+  return async function requireAuthUser(
+    req: AuthenticatedRequest,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> {
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith("Bearer ")) {
+      res.status(401).json({ error: "unauthorized", message: "Authentication is required." });
+      return;
+    }
+    const token = authHeader.slice("Bearer ".length).trim();
+    if (!token) {
+      res.status(401).json({ error: "unauthorized", message: "Authentication is required." });
+      return;
+    }
+
+    try {
+      const identity = await resolveUserIdFromBearer(token);
+      if (!identity) {
+        if (isSupabaseAuthConfigured() || process.env.JWT_SECRET?.trim()) {
+          res.status(401).json({ error: "unauthorized", message: "Invalid authentication token." });
+          return;
+        }
+        res.status(503).json({
+          error: "auth_not_configured",
+          message: "Authentication is not configured.",
+        });
+        return;
+      }
+
+      const membership = await orgService.findOrgRoleByUserId(identity.userId);
+      req.auth = {
+        userId: identity.userId,
+        role: membership?.role ?? "associate",
+        orgId: membership?.org_id ?? "",
+        orgType: membership?.org_type ?? "funeral_home",
+        email: membership?.email || identity.email,
+        name: membership?.name || identity.name,
+      };
+      next();
+    } catch {
+      res.status(401).json({ error: "unauthorized", message: "Invalid authentication token." });
+    }
+  };
+}
+
 export function createRequireAuth(orgService: OrgService) {
   return async function requireAuth(
     req: AuthenticatedRequest,
@@ -49,7 +128,6 @@ export function createRequireAuth(orgService: OrgService) {
       const header = jwt.decode(token, { complete: true })?.header;
       const alg = header?.alg;
 
-      // Local / test tokens (HS256)
       if (alg === "HS256" && secret) {
         const decoded = jwt.verify(token, secret) as JwtPayload;
         const userId = decoded.sub;
@@ -79,7 +157,6 @@ export function createRequireAuth(orgService: OrgService) {
         return;
       }
 
-      // Supabase access tokens
       const user = await getUserFromSupabaseAccessToken(token);
       if (user) {
         const membership = await orgService.findOrgRoleByUserId(user.id);

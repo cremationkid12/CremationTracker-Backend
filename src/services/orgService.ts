@@ -9,10 +9,19 @@ import type {
   OrgType,
 } from "../types/domain";
 
+export type AttachMemberInput = {
+  userId: string;
+  orgId: string;
+  email: string;
+  name: string;
+  role: MemberRole;
+};
+
 export type OrgService = {
   findOrgRoleByUserId: (userId: string) => Promise<OrgRoleForUser | null>;
   getOrganization: (orgId: string) => Promise<Organization | null>;
   bootstrapOrgAndAdmin: (input: BootstrapOrgInput) => Promise<OrgRoleForUser>;
+  attachMember: (input: AttachMemberInput) => Promise<OrgRoleForUser>;
 };
 
 type MemoryState = {
@@ -78,6 +87,29 @@ export function createMemoryOrgService(state: MemoryState = createMemoryState())
         org_id: orgId,
         org_type: org.org_type,
         role: "admin",
+        email: member.email,
+        name: member.name,
+      };
+    },
+    async attachMember(input) {
+      const org = state.orgs.get(input.orgId);
+      if (!org) throw new Error("Organization not found.");
+      const email = input.email.trim().toLowerCase();
+      const existing = state.members.get(input.userId);
+      const member: OrgMember = {
+        id: input.userId,
+        org_id: input.orgId,
+        user_id: input.userId,
+        email,
+        name: input.name.trim() || existing?.name || email.split("@")[0],
+        role: input.role,
+        active: true,
+      };
+      state.members.set(input.userId, member);
+      return {
+        org_id: org.id,
+        org_type: org.org_type,
+        role: member.role,
         email: member.email,
         name: member.name,
       };
@@ -161,6 +193,32 @@ function createPgOrgService(): OrgService {
         role: "admin",
         email,
         name: input.name.trim(),
+      };
+    },
+    async attachMember(input) {
+      const pool = getPgPool();
+      const org = await this.getOrganization(input.orgId);
+      if (!org) throw new Error("Organization not found.");
+      const email = input.email.trim().toLowerCase();
+      const name = input.name.trim() || email.split("@")[0];
+      await pool.query(
+        `INSERT INTO org_members (id, org_id, user_id, email, name, role, active)
+         VALUES ($1, $2, $3, $4, $5, $6, true)
+         ON CONFLICT (id) DO UPDATE
+           SET org_id = EXCLUDED.org_id,
+               email = EXCLUDED.email,
+               name = EXCLUDED.name,
+               role = EXCLUDED.role,
+               active = true,
+               updated_at = NOW()`,
+        [input.userId, input.orgId, input.userId, email, name, input.role],
+      );
+      return {
+        org_id: org.id,
+        org_type: org.org_type,
+        role: input.role,
+        email,
+        name,
       };
     },
   };

@@ -7,12 +7,14 @@ import {
   AuthNotConfiguredError,
   type AuthService,
 } from "../services/authService";
+import { InviteError, type InviteService } from "../services/inviteService";
 import type { OrgService } from "../services/orgService";
 import type { OrgType } from "../types/domain";
 
 export type AuthControllerDeps = {
   authService: AuthService;
   orgService: OrgService;
+  inviteService: InviteService;
 };
 
 function isValidEmail(email: string): boolean {
@@ -59,12 +61,22 @@ export async function postRegister(
   const orgType = parseOrgType(req.body?.org_type);
   const phone = typeof req.body?.phone === "string" ? req.body.phone.trim() : undefined;
   const address = typeof req.body?.address === "string" ? req.body.address.trim() : undefined;
+  const inviteToken =
+    typeof req.body?.invite_token === "string" ? req.body.invite_token.trim() : "";
 
-  if (!name || !email || !isValidEmail(email) || password.length < 8 || !orgType || !orgName) {
+  if (!name || !email || !isValidEmail(email) || password.length < 8) {
+    res.status(400).json({
+      error: "bad_request",
+      message: "name, valid email, and password (min 8) are required.",
+    });
+    return;
+  }
+
+  if (!inviteToken && (!orgType || !orgName)) {
     res.status(400).json({
       error: "bad_request",
       message:
-        "name, valid email, password (min 8), org_type (funeral_home|crematory), and org_name are required.",
+        "org_type (funeral_home|crematory) and org_name are required unless joining with invite_token.",
     });
     return;
   }
@@ -73,15 +85,22 @@ export async function postRegister(
 
   try {
     const session = await deps.authService.register(email, password, name);
-    const membership = await deps.orgService.bootstrapOrgAndAdmin({
-      userId: session.user_id,
-      email,
-      name,
-      orgType,
-      orgName,
-      phone,
-      address,
-    });
+    const membership = inviteToken
+      ? await deps.inviteService.acceptInvite({
+          rawToken: inviteToken,
+          userId: session.user_id,
+          email,
+          name,
+        })
+      : await deps.orgService.bootstrapOrgAndAdmin({
+          userId: session.user_id,
+          email,
+          name,
+          orgType: orgType!,
+          orgName,
+          phone,
+          address,
+        });
     res.status(201).json({
       ...session,
       user: {
@@ -96,6 +115,13 @@ export async function postRegister(
   } catch (error) {
     if (error instanceof AuthNotConfiguredError) {
       res.status(503).json({ error: "service_unavailable", message: error.message });
+      return;
+    }
+    if (error instanceof InviteError) {
+      res.status(error.code === "not_found" ? 404 : 400).json({
+        error: error.code,
+        message: error.message,
+      });
       return;
     }
     if (error instanceof AuthFailedError) {
@@ -116,6 +142,8 @@ export async function postLogin(
 ): Promise<void> {
   const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
   const password = typeof req.body?.password === "string" ? req.body.password : "";
+  const inviteToken =
+    typeof req.body?.invite_token === "string" ? req.body.invite_token.trim() : "";
 
   if (!email || !isValidEmail(email) || !password) {
     res.status(400).json({
@@ -129,7 +157,15 @@ export async function postLogin(
 
   try {
     const session = await deps.authService.login(email, password);
-    const membership = await deps.orgService.findOrgRoleByUserId(session.user_id);
+    let membership = await deps.orgService.findOrgRoleByUserId(session.user_id);
+    if (inviteToken) {
+      membership = await deps.inviteService.acceptInvite({
+        rawToken: inviteToken,
+        userId: session.user_id,
+        email,
+        name: membership?.name || email.split("@")[0],
+      });
+    }
     if (!membership) {
       res.status(401).json({
         error: "unauthorized",
@@ -151,6 +187,13 @@ export async function postLogin(
   } catch (error) {
     if (error instanceof AuthNotConfiguredError) {
       res.status(503).json({ error: "service_unavailable", message: error.message });
+      return;
+    }
+    if (error instanceof InviteError) {
+      res.status(error.code === "not_found" ? 404 : 400).json({
+        error: error.code,
+        message: error.message,
+      });
       return;
     }
     res.status(401).json({
