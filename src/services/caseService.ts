@@ -1,4 +1,5 @@
 import { randomBytes, randomInt, randomUUID } from "node:crypto";
+import { casePriceCents, freeLiveCasesPerOrg } from "../config/billing";
 import { getPgPool, hasDatabase } from "../db/pool";
 import type { OrgType } from "../types/domain";
 import { sha256Hex } from "./authService";
@@ -34,6 +35,8 @@ export type CaseRecord = {
   decedent_display_name: string;
   intake: Record<string, unknown>;
   billing_status: string | null;
+  billing_provider?: string | null;
+  billing_transaction_id?: string | null;
   created_by_user_id: string;
   created_at: string;
   updated_at: string;
@@ -94,6 +97,18 @@ export type ClaimCaseInput = {
   pin?: string;
 };
 
+export type ActivatePaidCaseInput = {
+  caseId: string;
+  provider: "stripe" | "mock";
+  transactionId: string;
+};
+
+export type OrgCredits = {
+  free_live_cases_remaining: number;
+  live_cases_created: number;
+  case_price_cents: number;
+};
+
 export class CaseServiceError extends Error {
   constructor(
     message: string,
@@ -114,6 +129,9 @@ export type CaseService = {
   getCase: (orgId: string, orgType: OrgType, caseId: string) => Promise<CaseDetail | null>;
   recordStep: (input: RecordStepInput) => Promise<CaseDetail>;
   claimCase: (input: ClaimCaseInput) => Promise<CaseDetail>;
+  getOrgCredits: (orgId: string) => Promise<OrgCredits>;
+  /** Issue QR/PIN after payment for a pending/failed live case. Idempotent on same transaction. */
+  activatePaidCase: (input: ActivatePaidCaseInput) => Promise<CaseDetail>;
   getFamilyStatusByPin: (pin: string) => Promise<import("./familyStatus").FamilyStatusResponse>;
   getFamilyStatusByToken: (
     token: string,
@@ -228,23 +246,23 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
       let pinHash: string | null = null;
 
       if (input.caseMode === "live") {
+        const freeDefault = freeLiveCasesPerOrg();
         const credits = orgService._state.credits.get(input.ownerOrgId) ?? {
-          free_live_cases_remaining: 3,
+          free_live_cases_remaining: freeDefault,
           live_cases_created: 0,
         };
         if (credits.free_live_cases_remaining > 0) {
           credits.free_live_cases_remaining -= 1;
           billingStatus = "free_credit";
+          qrPayload = generateQrToken();
+          pin = generatePin();
+          qrHash = sha256Hex(qrPayload);
+          pinHash = sha256Hex(pin);
         } else {
           billingStatus = "pending";
         }
         credits.live_cases_created += 1;
         orgService._state.credits.set(input.ownerOrgId, credits);
-
-        qrPayload = generateQrToken();
-        pin = generatePin();
-        qrHash = sha256Hex(qrPayload);
-        pinHash = sha256Hex(pin);
       }
 
       const now = new Date().toISOString();
@@ -466,6 +484,69 @@ export function createMemoryCaseService(orgService: MemoryOrgService): CaseServi
       });
     },
 
+    async getOrgCredits(orgId) {
+      const freeDefault = freeLiveCasesPerOrg();
+      const credits = orgService._state.credits.get(orgId) ?? {
+        free_live_cases_remaining: freeDefault,
+        live_cases_created: 0,
+      };
+      return {
+        free_live_cases_remaining: credits.free_live_cases_remaining,
+        live_cases_created: credits.live_cases_created,
+        case_price_cents: casePriceCents(),
+      };
+    },
+
+    async activatePaidCase(input) {
+      const record = cases.get(input.caseId);
+      if (!record) throw new CaseServiceError("Case not found.", "not_found");
+      if (record.case_mode !== "live") {
+        throw new CaseServiceError("Only live cases require payment.", "bad_request");
+      }
+      if (record.billing_status === "paid" || record.billing_status === "free_credit") {
+        if (
+          record.billing_status === "paid" &&
+          record.billing_transaction_id &&
+          record.billing_transaction_id !== input.transactionId
+        ) {
+          throw new CaseServiceError("Case already paid with a different transaction.", "conflict");
+        }
+        const secret = secrets.get(record.id);
+        return buildDetail({
+          record,
+          caseSteps: steps.get(record.id) ?? [],
+          viewerOrgId: record.owner_org_id,
+          viewerOrgType: "funeral_home",
+          extras: secret
+            ? { pin: secret.pin, qr_payload: secret.qr_token, family_token: secret.family_token }
+            : undefined,
+        });
+      }
+      if (record.billing_status !== "pending" && record.billing_status !== "failed") {
+        throw new CaseServiceError("Case is not awaiting payment.", "conflict");
+      }
+
+      const qrPayload = generateQrToken();
+      const pin = generatePin();
+      const familyToken = randomBytes(24).toString("base64url");
+      const now = new Date().toISOString();
+      record.qr_token_hash = sha256Hex(qrPayload);
+      record.pin_hash = sha256Hex(pin);
+      record.billing_status = "paid";
+      record.billing_provider = input.provider;
+      record.billing_transaction_id = input.transactionId;
+      record.updated_at = now;
+      secrets.set(record.id, { pin, qr_token: qrPayload, family_token: familyToken });
+
+      return buildDetail({
+        record,
+        caseSteps: steps.get(record.id) ?? [],
+        viewerOrgId: record.owner_org_id,
+        viewerOrgType: "funeral_home",
+        extras: { pin, qr_payload: qrPayload, family_token: familyToken },
+      });
+    },
+
     async getFamilyStatusByPin(pin) {
       const normalized = pin.trim();
       for (const [caseId, secret] of secrets.entries()) {
@@ -542,20 +623,24 @@ function createPgCaseService(): CaseService {
              FROM org_case_credits WHERE org_id = $1 FOR UPDATE`,
             [input.ownerOrgId],
           );
-          let free = creditResult.rows[0]?.free_live_cases_remaining ?? 3;
+          let free = creditResult.rows[0]?.free_live_cases_remaining ?? freeLiveCasesPerOrg();
           let created = creditResult.rows[0]?.live_cases_created ?? 0;
           if (!creditResult.rows[0]) {
             await client.query(
               `INSERT INTO org_case_credits (org_id, free_live_cases_remaining, live_cases_created)
-               VALUES ($1, 3, 0)`,
-              [input.ownerOrgId],
+               VALUES ($1, $2, 0)`,
+              [input.ownerOrgId, freeLiveCasesPerOrg()],
             );
-            free = 3;
+            free = freeLiveCasesPerOrg();
             created = 0;
           }
           if (free > 0) {
             free -= 1;
             billingStatus = "free_credit";
+            qrPayload = generateQrToken();
+            pin = generatePin();
+            qrHash = sha256Hex(qrPayload);
+            pinHash = sha256Hex(pin);
           } else {
             billingStatus = "pending";
           }
@@ -566,15 +651,13 @@ function createPgCaseService(): CaseService {
              WHERE org_id = $1`,
             [input.ownerOrgId, free, created],
           );
-
-          qrPayload = generateQrToken();
-          pin = generatePin();
-          qrHash = sha256Hex(qrPayload);
-          pinHash = sha256Hex(pin);
         }
 
         const id = randomUUID();
-        const familyToken = input.caseMode === "live" ? randomBytes(24).toString("base64url") : null;
+        const familyToken =
+          input.caseMode === "live" && pin && qrPayload
+            ? randomBytes(24).toString("base64url")
+            : null;
         const insert = await client.query<CaseRecord>(
           `INSERT INTO cases (
              id, owner_org_id, custody_org_id, case_mode, status,
@@ -891,6 +974,137 @@ function createPgCaseService(): CaseService {
           caseSteps,
           viewerOrgId: input.crematoryOrgId,
           viewerOrgType: "crematory",
+        });
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      } finally {
+        client.release();
+      }
+    },
+
+    async getOrgCredits(orgId) {
+      const pool = getPgPool();
+      const result = await pool.query<{
+        free_live_cases_remaining: number;
+        live_cases_created: number;
+      }>(
+        `SELECT free_live_cases_remaining, live_cases_created
+         FROM org_case_credits WHERE org_id = $1`,
+        [orgId],
+      );
+      return {
+        free_live_cases_remaining:
+          result.rows[0]?.free_live_cases_remaining ?? freeLiveCasesPerOrg(),
+        live_cases_created: result.rows[0]?.live_cases_created ?? 0,
+        case_price_cents: casePriceCents(),
+      };
+    },
+
+    async activatePaidCase(input) {
+      const pool = getPgPool();
+      const client = await pool.connect();
+      try {
+        await client.query("BEGIN");
+        const found = await client.query<
+          CaseRecord & {
+            billing_provider: string | null;
+            billing_transaction_id: string | null;
+          }
+        >(
+          `SELECT id, owner_org_id, custody_org_id, case_mode, status, decedent_display_name,
+                  intake, billing_status, billing_provider, billing_transaction_id,
+                  created_by_user_id, created_at::text, updated_at::text,
+                  qr_token_hash, pin_hash
+           FROM cases WHERE id = $1 FOR UPDATE`,
+          [input.caseId],
+        );
+        const record = found.rows[0];
+        if (!record) throw new CaseServiceError("Case not found.", "not_found");
+        if (record.case_mode !== "live") {
+          throw new CaseServiceError("Only live cases require payment.", "bad_request");
+        }
+
+        if (record.billing_status === "paid" || record.billing_status === "free_credit") {
+          if (
+            record.billing_status === "paid" &&
+            record.billing_transaction_id &&
+            record.billing_transaction_id !== input.transactionId
+          ) {
+            throw new CaseServiceError(
+              "Case already paid with a different transaction.",
+              "conflict",
+            );
+          }
+          await client.query("COMMIT");
+          const caseSteps = await loadSteps(record.id);
+          const secret = await pool.query<{
+            pin: string;
+            qr_token: string;
+            family_token: string;
+          }>(`SELECT pin, qr_token, family_token FROM case_share_secrets WHERE case_id = $1`, [
+            record.id,
+          ]);
+          return buildDetail({
+            record,
+            caseSteps,
+            viewerOrgId: record.owner_org_id,
+            viewerOrgType: "funeral_home",
+            extras: secret.rows[0]
+              ? {
+                  pin: secret.rows[0].pin,
+                  qr_payload: secret.rows[0].qr_token,
+                  family_token: secret.rows[0].family_token,
+                }
+              : undefined,
+          });
+        }
+
+        if (record.billing_status !== "pending" && record.billing_status !== "failed") {
+          throw new CaseServiceError("Case is not awaiting payment.", "conflict");
+        }
+
+        const qrPayload = generateQrToken();
+        const pin = generatePin();
+        const familyToken = randomBytes(24).toString("base64url");
+
+        await client.query(
+          `UPDATE cases
+           SET qr_token_hash = $2, pin_hash = $3,
+               billing_status = 'paid', billing_provider = $4, billing_transaction_id = $5,
+               updated_at = NOW()
+           WHERE id = $1`,
+          [
+            record.id,
+            sha256Hex(qrPayload),
+            sha256Hex(pin),
+            input.provider,
+            input.transactionId,
+          ],
+        );
+        await client.query(
+          `INSERT INTO case_share_secrets (case_id, pin, qr_token, family_token)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (case_id) DO UPDATE
+             SET pin = EXCLUDED.pin, qr_token = EXCLUDED.qr_token,
+                 family_token = EXCLUDED.family_token`,
+          [record.id, pin, qrPayload, familyToken],
+        );
+        await client.query(
+          `INSERT INTO family_access (id, case_id, access_token_hash)
+           VALUES ($1, $2, $3)`,
+          [randomUUID(), record.id, sha256Hex(familyToken)],
+        );
+
+        await client.query("COMMIT");
+        const updated = await loadRecord(record.id);
+        const caseSteps = await loadSteps(record.id);
+        return buildDetail({
+          record: updated!,
+          caseSteps,
+          viewerOrgId: record.owner_org_id,
+          viewerOrgType: "funeral_home",
+          extras: { pin, qr_payload: qrPayload, family_token: familyToken },
         });
       } catch (error) {
         await client.query("ROLLBACK");

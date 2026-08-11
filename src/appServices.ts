@@ -1,4 +1,5 @@
 import type { AuthService } from "./services/authService";
+import type { BillingService } from "./services/billingService";
 import type { CaseService } from "./services/caseService";
 import type { InviteMailer } from "./services/inviteMailer";
 import type { InviteService } from "./services/inviteService";
@@ -10,4 +11,5 @@ export type AppServices = {
   caseService: CaseService;
   inviteService: InviteService;
   inviteMailer: InviteMailer;
+  billingService: BillingService;
 };

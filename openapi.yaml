@@ -16,6 +16,7 @@ tags:
   - name: Auth
   - name: Organizations
   - name: Cases
+  - name: Billing
   - name: Public
 paths:
   /v1/health:
@@ -149,7 +150,8 @@ paths:
       summary: Create test or live case
       description: |
         Funeral home only. `case_mode=test` — no QR/PIN, no charge.
-        `case_mode=live` — generates QR/PIN and applies free credit or per-case billing.
+        `case_mode=live` — uses a free credit (QR/PIN issued) or creates a `pending`
+        case without QR/PIN until `POST /v1/cases/{caseId}/billing/checkout` succeeds.
       operationId: createCase
       security:
         - bearerAuth: []
@@ -176,6 +178,78 @@ paths:
           $ref: "#/components/responses/ForbiddenError"
         "501":
           $ref: "#/components/responses/NotImplementedError"
+
+  /v1/billing/credits:
+    get:
+      tags: [Billing]
+      summary: Funeral home free-credit balance and case price
+      operationId: getBillingCredits
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Credits remaining
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [free_live_cases_remaining, live_cases_created, case_price_cents]
+                properties:
+                  free_live_cases_remaining:
+                    type: integer
+                  live_cases_created:
+                    type: integer
+                  case_price_cents:
+                    type: integer
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+
+  /v1/cases/{caseId}/billing/checkout:
+    post:
+      tags: [Billing]
+      summary: Start checkout to unlock a pending live case
+      description: |
+        With Stripe configured, returns a Checkout URL. Without Stripe (dev/mock),
+        immediately marks the case paid and returns QR/PIN on the case payload.
+      operationId: startCaseBillingCheckout
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+      responses:
+        "200":
+          description: Checkout session or mock activation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [provider, case_price_cents, case_price_label]
+                properties:
+                  provider:
+                    type: string
+                    enum: [stripe, mock]
+                  checkout_url:
+                    type: string
+                    nullable: true
+                  session_id:
+                    type: string
+                  case_price_cents:
+                    type: integer
+                  case_price_label:
+                    type: string
+                  case:
+                    $ref: "#/components/schemas/CaseDetail"
+        "409":
+          $ref: "#/components/responses/ConflictError"
+
+  /v1/billing/webhook:
+    post:
+      tags: [Billing]
+      summary: Stripe webhook (checkout.session.completed)
+      operationId: stripeBillingWebhook
+      responses:
+        "200":
+          description: Event received
 
   /v1/cases/{caseId}:
     get:
@@ -512,6 +586,12 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     NotFoundError:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ConflictError:
+      description: Conflict with current resource state
       content:
         application/json:
           schema:

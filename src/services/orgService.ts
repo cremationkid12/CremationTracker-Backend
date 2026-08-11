@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { freeLiveCasesPerOrg } from "../config/billing";
 import { getPgPool, hasDatabase } from "../db/pool";
 import type {
   BootstrapOrgInput,
@@ -81,7 +82,10 @@ export function createMemoryOrgService(state: MemoryState = createMemoryState())
       state.orgs.set(orgId, org);
       state.members.set(input.userId, member);
       if (input.orgType === "funeral_home") {
-        state.credits.set(orgId, { free_live_cases_remaining: 3, live_cases_created: 0 });
+        state.credits.set(orgId, {
+          free_live_cases_remaining: freeLiveCasesPerOrg(),
+          live_cases_created: 0,
+        });
       }
       return {
         org_id: orgId,
@@ -175,8 +179,8 @@ function createPgOrgService(): OrgService {
         if (input.orgType === "funeral_home") {
           await client.query(
             `INSERT INTO org_case_credits (org_id, free_live_cases_remaining, live_cases_created)
-             VALUES ($1, 3, 0)`,
-            [orgId],
+             VALUES ($1, $2, 0)`,
+            [orgId, freeLiveCasesPerOrg()],
           );
         }
         await client.query("COMMIT");

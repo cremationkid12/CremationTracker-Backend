@@ -43,7 +43,9 @@ API docs: [http://localhost:8020/docs](http://localhost:8020/docs)
 | Record process steps (custody-gated) | Done |
 | Crematory claim via PIN/QR | Done |
 | Public family status | Done |
-| Associate invites / billing / push | Later |
+| Associate invites | Done |
+| Per-case billing (Stripe + mock) | Done (Apple IAP later) |
+| Push notifications | Later |
 
 ### Auth note
 

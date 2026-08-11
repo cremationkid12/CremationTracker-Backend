@@ -1,8 +1,9 @@
 import express from "express";
-import type { Express } from "express";
+import type { Express, Request, Response } from "express";
 import type { AppServices } from "./appServices";
 import { registerV1Routes } from "./routes";
 import { createDefaultAuthService, type AuthService } from "./services/authService";
+import { createBillingService, type BillingService } from "./services/billingService";
 import {
   createDefaultCaseService,
   createMemoryCaseService,
@@ -21,6 +22,7 @@ import {
 } from "./services/orgService";
 import { setupSwaggerUi } from "./swaggerUi";
 import { hasDatabase } from "./db/pool";
+import { stripeWebhook } from "./controllers/billingController";
 
 export type AppDependencies = {
   authService?: AuthService;
@@ -28,6 +30,7 @@ export type AppDependencies = {
   caseService?: CaseService;
   inviteService?: InviteService;
   inviteMailer?: InviteMailer;
+  billingService?: BillingService;
 };
 
 export function createApp(deps: AppDependencies = {}): Express {
@@ -56,8 +59,6 @@ export function createApp(deps: AppDependencies = {}): Express {
     next();
   });
 
-  app.use(express.json({ limit: "1mb" }));
-
   const orgService = deps.orgService ?? createDefaultOrgService();
   const inviteService =
     deps.inviteService ??
@@ -69,13 +70,25 @@ export function createApp(deps: AppDependencies = {}): Express {
     (hasDatabase()
       ? createDefaultCaseService()
       : createMemoryCaseService(orgService as ReturnType<typeof createMemoryOrgService>));
+  const billingService = deps.billingService ?? createBillingService(caseService);
   const services: AppServices = {
     authService: deps.authService ?? createDefaultAuthService(),
     orgService,
     caseService,
     inviteService,
     inviteMailer: deps.inviteMailer ?? createDefaultInviteMailer(),
+    billingService,
   };
+
+  // Stripe webhooks need the raw body — mount before express.json().
+  app.post(
+    "/v1/billing/webhook",
+    express.raw({ type: "application/json" }),
+    (req: Request, res: Response) =>
+      stripeWebhook(req as never, res, { billingService: services.billingService }),
+  );
+
+  app.use(express.json({ limit: "1mb" }));
 
   setupSwaggerUi(app);
   registerV1Routes(app, services);
