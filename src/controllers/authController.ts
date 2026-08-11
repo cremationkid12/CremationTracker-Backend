@@ -1,5 +1,7 @@
 import type { Request, Response } from "express";
 import type { AuthenticatedRequest } from "../auth/authMiddleware";
+import { isSupabaseAuthConfigured } from "../auth/supabaseAccessTokenUser";
+import { hasDatabase } from "../db/pool";
 import {
   AuthFailedError,
   AuthNotConfiguredError,
@@ -20,6 +22,18 @@ function isValidEmail(email: string): boolean {
 function parseOrgType(value: unknown): OrgType | null {
   if (value === "funeral_home" || value === "crematory") return value;
   return null;
+}
+
+function requirePersistentDbForSupabase(res: Response): boolean {
+  if (isSupabaseAuthConfigured() && !hasDatabase()) {
+    res.status(503).json({
+      error: "service_unavailable",
+      message:
+        "DATABASE_URL is required when Supabase auth is configured. Use a dedicated Cremation Tracker Postgres (Supabase) project.",
+    });
+    return false;
+  }
+  return true;
 }
 
 export function getAuthMe(req: AuthenticatedRequest, res: Response): void {
@@ -54,6 +68,8 @@ export async function postRegister(
     });
     return;
   }
+
+  if (!requirePersistentDbForSupabase(res)) return;
 
   try {
     const session = await deps.authService.register(email, password, name);
@@ -109,6 +125,8 @@ export async function postLogin(
     return;
   }
 
+  if (!requirePersistentDbForSupabase(res)) return;
+
   try {
     const session = await deps.authService.login(email, password);
     const membership = await deps.orgService.findOrgRoleByUserId(session.user_id);
@@ -138,6 +156,39 @@ export async function postLogin(
     res.status(401).json({
       error: "unauthorized",
       message: error instanceof Error ? error.message : "Login failed.",
+    });
+  }
+}
+
+export async function postRefresh(
+  req: Request,
+  res: Response,
+  authService: AuthService,
+): Promise<void> {
+  const refreshToken =
+    typeof req.body?.refresh_token === "string" ? req.body.refresh_token.trim() : "";
+  if (!refreshToken) {
+    res.status(400).json({ error: "bad_request", message: "refresh_token is required." });
+    return;
+  }
+  if (!authService.refresh) {
+    res.status(501).json({
+      error: "not_implemented",
+      message: "Token refresh requires Supabase auth.",
+    });
+    return;
+  }
+  try {
+    const session = await authService.refresh(refreshToken);
+    res.status(200).json(session);
+  } catch (error) {
+    if (error instanceof AuthNotConfiguredError) {
+      res.status(503).json({ error: "service_unavailable", message: error.message });
+      return;
+    }
+    res.status(401).json({
+      error: "unauthorized",
+      message: error instanceof Error ? error.message : "Refresh failed.",
     });
   }
 }

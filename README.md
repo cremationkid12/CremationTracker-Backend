@@ -30,23 +30,26 @@ curl http://localhost:8020/v1/health
 
 API docs: [http://localhost:8020/docs](http://localhost:8020/docs)
 
-## Current status (Phase 1 in progress)
+## Current status
 
 | Area | Status |
 |------|--------|
 | Health + Swagger + OpenAPI contract | Done |
-| DB migration `001_init` | Done |
-| Local JWT auth register/login/me | Done |
+| DB migrations `001` + `002` (share secrets) | Done |
+| Local JWT auth (tests / offline) | Done |
+| **Supabase Auth** (when `SUPABASE_*` set) | Done |
 | Org bootstrap (funeral_home / crematory admin) | Done |
 | Create/list/get cases (test + live QR/PIN) | Done |
 | Record process steps (custody-gated) | Done |
 | Crematory claim via PIN/QR | Done |
-| Family public / billing / push | Later phases |
-| Supabase Auth swap | When CT Supabase project is ready |
+| Public family status | Done |
+| Associate invites / billing / push | Later |
 
 ### Auth note
 
-Phase 1 uses **local JWT auth** (`JWT_SECRET`) so development can proceed before Supabase is provisioned. Set `DATABASE_URL` to persist orgs/cases in Postgres; without it, the API uses in-memory stores (fine for local smoke tests).
+- **Default without Supabase:** local JWT (`JWT_SECRET`) + in-memory or Postgres if `DATABASE_URL` is set.
+- **Staging/production:** set `SUPABASE_URL`, `SUPABASE_ANON_KEY`, and `DATABASE_URL` on a **dedicated** project. See [`docs/supabase-setup.md`](./docs/supabase-setup.md).
+- Middleware accepts HS256 test tokens **or** Supabase access tokens.
 
 ## Tests
 

@@ -2,7 +2,13 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { createRequireAuth, type AuthenticatedRequest } from "../auth/authMiddleware";
 import type { AppServices } from "../appServices";
-import { getAuthMe, postLogin, postRegister, type AuthControllerDeps } from "../controllers/authController";
+import {
+  getAuthMe,
+  postLogin,
+  postRefresh,
+  postRegister,
+  type AuthControllerDeps,
+} from "../controllers/authController";
 
 export function createAuthRouter(services: AppServices): Router {
   const router = Router();
@@ -17,6 +23,9 @@ export function createAuthRouter(services: AppServices): Router {
   );
   router.post("/register", (req: Request, res: Response) => postRegister(req, res, authDeps));
   router.post("/login", (req: Request, res: Response) => postLogin(req, res, authDeps));
+  router.post("/refresh", (req: Request, res: Response) =>
+    postRefresh(req, res, services.authService),
+  );
 
   return router;
 }
