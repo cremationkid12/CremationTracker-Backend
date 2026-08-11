@@ -1,0 +1,524 @@
+openapi: 3.0.3
+info:
+  title: Cremation Tracker API
+  version: 0.1.0
+  description: |
+    REST API for Cremation Tracker — funeral home case creation, crematory custody
+    handoff via QR/PIN, and family web status. See docs/cremation-tracker-development-approach.md
+    in the Vinko workspace for the full product approach.
+  contact:
+    name: Cremation Tracker Engineering
+servers:
+  - url: http://localhost:8020
+    description: Local development
+tags:
+  - name: Health
+  - name: Auth
+  - name: Organizations
+  - name: Cases
+  - name: Public
+paths:
+  /v1/health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: getHealth
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, service, version]
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: cremation-tracker-api
+                  version:
+                    type: string
+                    example: "0.1.0"
+
+  # ── Auth (Phase 1) ──────────────────────────────────────────────────────────
+  /v1/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register admin and create organization
+      description: |
+        Funeral home or crematory admin signs up. Creates organization + admin membership.
+        Implementation lands in Phase 1.
+      operationId: postAuthRegister
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account and organization created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSessionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequestError"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login with email and password
+      operationId: postAuthLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthCredentialsRequest"
+      responses:
+        "200":
+          description: Authenticated session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthSessionResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  /v1/auth/me:
+    get:
+      tags: [Auth]
+      summary: Current authenticated user context
+      operationId: getAuthMe
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: User + org + role
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthMeResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  # ── Cases (Phase 1) ─────────────────────────────────────────────────────────
+  /v1/cases:
+    get:
+      tags: [Cases]
+      summary: List cases for the caller's organization
+      description: |
+        Funeral home — cases owned by the org (filter by status: active|archived).
+        Crematory — cases currently in custody.
+      operationId: listCases
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [active, completed, archived]
+        - name: case_mode
+          in: query
+          schema:
+            type: string
+            enum: [test, live]
+      responses:
+        "200":
+          description: Case list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseListResponse"
+        "401":
+          $ref: "#/components/responses/UnauthorizedError"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+    post:
+      tags: [Cases]
+      summary: Create test or live case
+      description: |
+        Funeral home only. `case_mode=test` — no QR/PIN, no charge.
+        `case_mode=live` — generates QR/PIN and applies free credit or per-case billing.
+      operationId: createCase
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCaseRequest"
+      responses:
+        "201":
+          description: Case created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseDetail"
+        "402":
+          description: Payment required for additional live case
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          $ref: "#/components/responses/ForbiddenError"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  /v1/cases/{caseId}:
+    get:
+      tags: [Cases]
+      summary: Get case detail (role-scoped fields)
+      operationId: getCase
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+      responses:
+        "200":
+          description: Case detail with visibility filtered by org type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseDetail"
+        "404":
+          $ref: "#/components/responses/NotFoundError"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  /v1/cases/{caseId}/steps:
+    post:
+      tags: [Cases]
+      summary: Record a process step (append-only)
+      operationId: postCaseStep
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RecordStepRequest"
+      responses:
+        "201":
+          description: Step recorded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseStep"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  /v1/cases/claim:
+    post:
+      tags: [Cases]
+      summary: Crematory claim custody via QR token or PIN
+      operationId: claimCase
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ClaimCaseRequest"
+      responses:
+        "200":
+          description: Custody transferred to crematory
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CaseDetail"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+  # ── Public family (Phase 3) ─────────────────────────────────────────────────
+  /v1/public/family/{token}:
+    get:
+      tags: [Public]
+      summary: Family-safe case status by access token
+      operationId: getPublicFamilyStatus
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Family-safe timeline
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FamilyStatusResponse"
+        "501":
+          $ref: "#/components/responses/NotImplementedError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    CaseId:
+      name: caseId
+      in: path
+      required: true
+      schema:
+        type: string
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+
+    RegisterRequest:
+      type: object
+      required: [email, password, name, org_type, org_name]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 8
+        name:
+          type: string
+        org_type:
+          type: string
+          enum: [funeral_home, crematory]
+        org_name:
+          type: string
+        phone:
+          type: string
+        address:
+          type: string
+
+    AuthCredentialsRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+
+    AuthSessionResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        user:
+          $ref: "#/components/schemas/AuthMeResponse"
+
+    AuthMeResponse:
+      type: object
+      required: [user_id, email, org_id, org_type, role]
+      properties:
+        user_id:
+          type: string
+        email:
+          type: string
+        name:
+          type: string
+        org_id:
+          type: string
+        org_type:
+          type: string
+          enum: [funeral_home, crematory]
+        role:
+          type: string
+          enum: [admin, associate]
+
+    CreateCaseRequest:
+      type: object
+      required: [case_mode, decedent_display_name]
+      properties:
+        case_mode:
+          type: string
+          enum: [test, live]
+        decedent_display_name:
+          type: string
+        intake:
+          type: object
+          additionalProperties: true
+          description: Full intake fields (locked in Phase 0 field inventory)
+
+    CaseSummary:
+      type: object
+      required: [id, case_mode, status, decedent_display_name, created_at]
+      properties:
+        id:
+          type: string
+        case_mode:
+          type: string
+          enum: [test, live]
+        status:
+          type: string
+          enum: [active, completed, archived]
+        decedent_display_name:
+          type: string
+        current_step_label:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    CaseDetail:
+      allOf:
+        - $ref: "#/components/schemas/CaseSummary"
+        - type: object
+          properties:
+            owner_org_id:
+              type: string
+            custody_org_id:
+              type: string
+              nullable: true
+            intake:
+              type: object
+              additionalProperties: true
+              description: Filtered by caller org type
+            qr_payload:
+              type: string
+              nullable: true
+              description: Returned once on live create; never for crematory/family
+            pin:
+              type: string
+              nullable: true
+              description: Returned once on live create to funeral home
+            billing_status:
+              type: string
+              nullable: true
+            steps:
+              type: array
+              items:
+                $ref: "#/components/schemas/CaseStep"
+
+    CaseListResponse:
+      type: object
+      required: [cases, active_count]
+      properties:
+        active_count:
+          type: integer
+        cases:
+          type: array
+          items:
+            $ref: "#/components/schemas/CaseSummary"
+
+    RecordStepRequest:
+      type: object
+      required: [step_code]
+      properties:
+        step_code:
+          type: string
+          description: Stable code e.g. received_into_care, town_permit, cremation_complete
+        note:
+          type: string
+        metadata:
+          type: object
+          additionalProperties: true
+
+    CaseStep:
+      type: object
+      required: [id, step_code, step_label, recorded_at]
+      properties:
+        id:
+          type: string
+        step_code:
+          type: string
+        step_label:
+          type: string
+        note:
+          type: string
+          nullable: true
+        recorded_at:
+          type: string
+          format: date-time
+
+    ClaimCaseRequest:
+      type: object
+      properties:
+        qr_token:
+          type: string
+        pin:
+          type: string
+      description: Provide qr_token or pin
+
+    FamilyStatusResponse:
+      type: object
+      required: [decedent_display_name, steps]
+      properties:
+        decedent_display_name:
+          type: string
+        funeral_home_name:
+          type: string
+        current_step_label:
+          type: string
+        steps:
+          type: array
+          items:
+            type: object
+            required: [label, recorded_at]
+            properties:
+              label:
+                type: string
+              recorded_at:
+                type: string
+                format: date-time
+
+  responses:
+    BadRequestError:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnauthorizedError:
+      description: Missing or invalid auth
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ForbiddenError:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFoundError:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotImplementedError:
+      description: Contract defined; implementation pending
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"

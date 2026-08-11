@@ -1,0 +1,9 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+preDeployCommand = ["npm run db:migrate:prod"]
+startCommand = "node dist/server.js"
+healthcheckPath = "/v1/health"
+healthcheckTimeout = 300
