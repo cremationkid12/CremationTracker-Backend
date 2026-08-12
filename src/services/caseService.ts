@@ -1,5 +1,6 @@
 import { randomBytes, randomInt, randomUUID } from "node:crypto";
 import { casePriceCents, freeLiveCasesPerOrg } from "../config/billing";
+import { buildFamilyStatusUrl } from "../config/familyPortal";
 import { getPgPool, hasDatabase } from "../db/pool";
 import type { OrgType } from "../types/domain";
 import { sha256Hex } from "./authService";
@@ -62,6 +63,8 @@ export type CaseDetail = {
   qr_payload?: string | null;
   pin?: string | null;
   family_token?: string | null;
+  /** Absolute family portal URL when secrets exist */
+  family_url?: string | null;
 };
 
 export type CaseSummary = {
@@ -176,6 +179,7 @@ function buildDetail(args: {
     resolvedCustodyType,
   );
 
+  const familyToken = isOwner ? (extras?.family_token ?? null) : null;
   return {
     id: record.id,
     owner_org_id: record.owner_org_id,
@@ -192,7 +196,8 @@ function buildDetail(args: {
     available_next_steps: record.status === "active" ? toAvailable(available) : [],
     qr_payload: isOwner ? (extras?.qr_payload ?? null) : null,
     pin: isOwner ? (extras?.pin ?? null) : null,
-    family_token: isOwner ? (extras?.family_token ?? null) : null,
+    family_token: familyToken,
+    family_url: familyToken ? buildFamilyStatusUrl(familyToken) : null,
   };
 }
 

@@ -251,6 +251,47 @@ paths:
         "200":
           description: Event received
 
+  /v1/cases/{caseId}/family/share-email:
+    post:
+      tags: [Cases]
+      summary: Email the family status link
+      description: |
+        Funeral home only. Sends the `/f/{token}` link via SendGrid when configured;
+        otherwise logs and returns the URL with delivered=false.
+      operationId: shareFamilyLinkEmail
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/CaseId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email:
+                  type: string
+                  format: email
+      responses:
+        "202":
+          description: Share accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [email, family_url, delivered]
+                properties:
+                  email:
+                    type: string
+                  family_url:
+                    type: string
+                  delivered:
+                    type: boolean
+        "409":
+          $ref: "#/components/responses/ConflictError"
+
   /v1/cases/{caseId}:
     get:
       tags: [Cases]
@@ -485,6 +526,14 @@ components:
               type: string
               nullable: true
               description: Returned once on live create to funeral home
+            family_token:
+              type: string
+              nullable: true
+              description: Owner-only token embedded in family_url
+            family_url:
+              type: string
+              nullable: true
+              description: Absolute family portal link (/f/{token})
             billing_status:
               type: string
               nullable: true

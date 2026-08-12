@@ -9,6 +9,10 @@ import {
   createMemoryCaseService,
   type CaseService,
 } from "./services/caseService";
+import {
+  createDefaultFamilyLinkMailer,
+  type FamilyLinkMailer,
+} from "./services/familyLinkMailer";
 import { createDefaultInviteMailer, type InviteMailer } from "./services/inviteMailer";
 import {
   createDefaultInviteService,
@@ -30,6 +34,7 @@ export type AppDependencies = {
   caseService?: CaseService;
   inviteService?: InviteService;
   inviteMailer?: InviteMailer;
+  familyLinkMailer?: FamilyLinkMailer;
   billingService?: BillingService;
 };
 
@@ -77,6 +82,7 @@ export function createApp(deps: AppDependencies = {}): Express {
     caseService,
     inviteService,
     inviteMailer: deps.inviteMailer ?? createDefaultInviteMailer(),
+    familyLinkMailer: deps.familyLinkMailer ?? createDefaultFamilyLinkMailer(),
     billingService,
   };
 

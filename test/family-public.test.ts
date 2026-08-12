@@ -44,6 +44,18 @@ describe("PIN re-view + family public status", () => {
     assert.equal(detail.body.pin, created.body.pin);
     assert.equal(detail.body.qr_payload, created.body.qr_payload);
     assert.equal(detail.body.family_token, created.body.family_token);
+    assert.ok(created.body.family_url);
+    assert.ok(String(created.body.family_url).includes(`/f/${created.body.family_token}`));
+    assert.equal(detail.body.family_url, created.body.family_url);
+
+    const share = await request(app)
+      .post(`/v1/cases/${created.body.id}/family/share-email`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ email: "family@example.com" });
+    assert.equal(share.status, 202);
+    assert.equal(share.body.email, "family@example.com");
+    assert.equal(share.body.family_url, created.body.family_url);
+    assert.equal(share.body.delivered, false);
 
     const byPin = await request(app).get(`/v1/public/family?pin=${created.body.pin}`);
     assert.equal(byPin.status, 200);
