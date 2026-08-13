@@ -63,4 +63,6 @@ npm test
 
 Uses `Dockerfile` and `railway.toml`. Set env vars (especially `DATABASE_URL`). Migrations run via `preDeployCommand`.
 
+Step-by-step: [`docs/deploy.md`](./docs/deploy.md).
+
 **Important:** use a **dedicated** Supabase/Postgres project — do not share EverRoute production data.
