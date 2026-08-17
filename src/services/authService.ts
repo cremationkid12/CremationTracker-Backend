@@ -85,14 +85,62 @@ function getSupabaseAuthClient() {
   });
 }
 
+function getSupabaseAdminClient() {
+  const url = process.env.SUPABASE_URL?.trim();
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  if (!url || !serviceKey) return null;
+  return createClient(url, serviceKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+function allowAutoConfirmEmail(): boolean {
+  if (process.env.ALLOW_AUTO_CONFIRM_EMAIL === "true") return true;
+  if (process.env.ALLOW_AUTO_CONFIRM_EMAIL === "false") return false;
+  return process.env.NODE_ENV !== "production";
+}
+
+async function sessionFromPassword(email: string, password: string): Promise<AuthSession> {
+  const client = getSupabaseAuthClient();
+  const { data, error } = await client.auth.signInWithPassword({
+    email: email.trim(),
+    password,
+  });
+  if (error) throw new AuthFailedError(error.message);
+  if (!data.user?.id || !data.session?.access_token || !data.session?.refresh_token) {
+    throw new AuthFailedError("Login did not return a complete auth session.");
+  }
+  return {
+    user_id: data.user.id,
+    access_token: data.session.access_token,
+    refresh_token: data.session.refresh_token,
+  };
+}
+
+async function confirmEmailAndSignIn(userId: string, email: string, password: string): Promise<AuthSession> {
+  const admin = getSupabaseAdminClient();
+  if (!admin || !allowAutoConfirmEmail()) {
+    throw new AuthFailedError(
+      "Account created but no session returned. Disable Confirm email in Supabase Auth (Authentication → Providers → Email), or confirm the email first.",
+    );
+  }
+  const { error } = await admin.auth.admin.updateUserById(userId, { email_confirm: true });
+  if (error) throw new AuthFailedError(error.message);
+  return sessionFromPassword(email, password);
+}
+
 /** Production auth via dedicated Cremation Tracker Supabase project. */
 export function createSupabaseAuthService(): AuthService {
   return {
     async register(email, password, displayName) {
       const client = getSupabaseAuthClient();
+      const trimmedEmail = email.trim();
       const trimmedName = displayName.trim();
       const { data, error } = await client.auth.signUp({
-        email: email.trim(),
+        email: trimmedEmail,
         password,
         options: {
           data: {
@@ -102,20 +150,35 @@ export function createSupabaseAuthService(): AuthService {
           },
         },
       });
-      if (error) throw new AuthFailedError(error.message);
+
+      if (error) {
+        const already =
+          /already registered|already exists|user already/i.test(error.message);
+        if (already) {
+          const admin = getSupabaseAdminClient();
+          if (admin && allowAutoConfirmEmail()) {
+            const listed = await admin.auth.admin.listUsers({ page: 1, perPage: 200 });
+            const existing = listed.data.users.find(
+              (u) => u.email?.toLowerCase() === trimmedEmail.toLowerCase(),
+            );
+            if (existing?.id) {
+              return confirmEmailAndSignIn(existing.id, trimmedEmail, password);
+            }
+          }
+        }
+        throw new AuthFailedError(error.message);
+      }
       if (!data.user?.id) {
         throw new AuthFailedError("Register did not return a user.");
       }
-      if (!data.session?.access_token || !data.session?.refresh_token) {
-        throw new AuthFailedError(
-          "Account created but no session returned. Disable email confirmation in Supabase Auth for staging, or confirm the email first.",
-        );
+      if (data.session?.access_token && data.session?.refresh_token) {
+        return {
+          user_id: data.user.id,
+          access_token: data.session.access_token,
+          refresh_token: data.session.refresh_token,
+        };
       }
-      return {
-        user_id: data.user.id,
-        access_token: data.session.access_token,
-        refresh_token: data.session.refresh_token,
-      };
+      return confirmEmailAndSignIn(data.user.id, trimmedEmail, password);
     },
 
     async login(email, password) {

@@ -40,8 +40,9 @@ ALLOWED_ORIGINS=http://localhost:8020,http://localhost:8080,http://localhost:517
 
 **Authentication → Providers → Email**
 
-For early staging, turn **off** “Confirm email” so `signUp` returns a session immediately.  
-Re-enable confirmation before public launch if required.
+Turn **off** “Confirm email” so `signUp` returns a session immediately, **or** leave it on — in non-production the API auto-confirms with `SUPABASE_SERVICE_ROLE_KEY` so Create account still signs you in.
+
+Re-enable confirmation (and set `ALLOW_AUTO_CONFIRM_EMAIL=false`) before public launch if required.
 
 ## 4. Migrate schema
 
