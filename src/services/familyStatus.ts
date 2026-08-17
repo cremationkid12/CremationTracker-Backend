@@ -1,10 +1,29 @@
 import type { CaseStep } from "./caseService";
 import { getStepDef } from "./stepCatalog";
 
-/** Family-facing labels — hide internal notes / staff-only wording when needed. */
+/** Family-facing labels from the Base44 prototype (not staff ops wording). */
+const FAMILY_STEP_LABELS: Record<string, string> = {
+  received_into_care: "Loved one has been brought into our care",
+  dressed_per_wishes: "Preparation of loved one",
+  documents_signed: "Preparation of loved one",
+  town_permit_applied: "Preparation of loved one",
+  me_clearance_received: "Preparation of loved one",
+  crematory_appointment_set: "Preparation of loved one",
+  placed_in_container: "Preparation of loved one",
+  transported_to_crematory: "Route to crematory",
+  dropped_off_at_crematory: "Have been received by crematory",
+  custody_accepted: "Have been received by crematory",
+  in_holding: "Loved one is in crematory holding facility",
+  cremation_in_progress: "Cremation in progress",
+  remains_sorted: "Cremation complete",
+  remains_processed: "Cremated remains preparation",
+  remains_boxed: "Cremated remains preparation",
+  remains_ready: "Cremated remains ready to be picked up by funeral home",
+  remains_returned: "Funeral home has picked up cremated remains",
+};
+
 export function toFamilyStepLabel(stepCode: string, fallbackLabel: string): string {
-  const def = getStepDef(stepCode);
-  return def?.label ?? fallbackLabel;
+  return FAMILY_STEP_LABELS[stepCode] ?? getStepDef(stepCode)?.label ?? fallbackLabel;
 }
 
 export type FamilyStatusResponse = {

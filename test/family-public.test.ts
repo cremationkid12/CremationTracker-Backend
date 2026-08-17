@@ -62,7 +62,8 @@ describe("PIN re-view + family public status", () => {
     assert.equal(byPin.body.decedent_display_name, "Jordan Hale");
     assert.equal(byPin.body.funeral_home_name, "Harbor FH");
     assert.ok(Array.isArray(byPin.body.steps));
-    assert.equal(byPin.body.steps[0].label.includes("Received"), true);
+    assert.equal(byPin.body.steps[0].label, "Loved one has been brought into our care");
+    assert.equal(byPin.body.intake, undefined);
 
     const byToken = await request(app).get(
       `/v1/public/family/${created.body.family_token}`,

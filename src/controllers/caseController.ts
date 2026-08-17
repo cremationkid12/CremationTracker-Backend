@@ -6,6 +6,7 @@ import {
   type CaseService,
   type CaseStatus,
 } from "../services/caseService";
+import { displayNameFromIntake, sanitizeIntake } from "../services/intakeFields";
 
 export type CaseControllerDeps = {
   caseService: CaseService;
@@ -75,14 +76,15 @@ export async function createCase(
   }
 
   const caseMode = req.body?.case_mode;
-  const decedentDisplayName =
-    typeof req.body?.decedent_display_name === "string"
-      ? req.body.decedent_display_name.trim()
-      : "";
-  const intake =
+  const rawIntake =
     req.body?.intake && typeof req.body.intake === "object" && !Array.isArray(req.body.intake)
       ? (req.body.intake as Record<string, unknown>)
       : {};
+  const intake = sanitizeIntake(rawIntake);
+  const decedentDisplayName =
+    (typeof req.body?.decedent_display_name === "string"
+      ? req.body.decedent_display_name.trim()
+      : "") || displayNameFromIntake(intake, "");
 
   if ((caseMode !== "test" && caseMode !== "live") || !decedentDisplayName) {
     res.status(400).json({

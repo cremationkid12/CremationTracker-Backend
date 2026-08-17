@@ -480,8 +480,36 @@ components:
           type: string
         intake:
           type: object
-          additionalProperties: true
-          description: Full intake fields (locked in Phase 0 field inventory)
+          additionalProperties: false
+          description: Funeral-home-only intake (Base44 field list). Crematory responses omit this.
+          properties:
+            person_name:
+              type: string
+            gender:
+              type: string
+              enum: [male, female, other]
+            date_of_birth:
+              type: string
+            date_of_death:
+              type: string
+            next_of_kin_name:
+              type: string
+            next_of_kin_relationship:
+              type: string
+            next_of_kin_address:
+              type: string
+            next_of_kin_phone:
+              type: string
+            next_of_kin_email:
+              type: string
+            designated_pickup_person:
+              type: string
+            contact_name:
+              type: string
+            contact_phone:
+              type: string
+            contact_email:
+              type: string
 
     CaseSummary:
       type: object
