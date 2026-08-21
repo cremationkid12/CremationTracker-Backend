@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
 import { createClient } from "@supabase/supabase-js";
 import jwt from "jsonwebtoken";
-import { isSupabaseAuthConfigured } from "../auth/supabaseAccessTokenUser";
+import { useSupabaseAuth } from "../auth/supabaseAccessTokenUser";
 
 export class AuthNotConfiguredError extends Error {
   constructor(
@@ -109,7 +109,7 @@ async function sessionFromPassword(email: string, password: string): Promise<Aut
     email: email.trim(),
     password,
   });
-  if (error) throw new AuthFailedError(error.message);
+  if (error) throw new AuthFailedError(mapSupabaseAuthError(error.message));
   if (!data.user?.id || !data.session?.access_token || !data.session?.refresh_token) {
     throw new AuthFailedError("Login did not return a complete auth session.");
   }
@@ -128,8 +128,18 @@ async function confirmEmailAndSignIn(userId: string, email: string, password: st
     );
   }
   const { error } = await admin.auth.admin.updateUserById(userId, { email_confirm: true });
-  if (error) throw new AuthFailedError(error.message);
+  if (error) throw new AuthFailedError(mapSupabaseAuthError(error.message));
   return sessionFromPassword(email, password);
+}
+
+function mapSupabaseAuthError(message: string): string {
+  if (/fetch failed|network|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|socket hang up/i.test(message)) {
+    return (
+      "Cannot reach Supabase Auth from the API server. " +
+      "For local development, set FORCE_LOCAL_AUTH=true in .env (or unset SUPABASE_URL and SUPABASE_ANON_KEY) and restart the backend."
+    );
+  }
+  return message;
 }
 
 /** Production auth via dedicated Cremation Tracker Supabase project. */
@@ -166,7 +176,7 @@ export function createSupabaseAuthService(): AuthService {
             }
           }
         }
-        throw new AuthFailedError(error.message);
+        throw new AuthFailedError(mapSupabaseAuthError(error.message));
       }
       if (!data.user?.id) {
         throw new AuthFailedError("Register did not return a user.");
@@ -187,7 +197,7 @@ export function createSupabaseAuthService(): AuthService {
         email: email.trim(),
         password,
       });
-      if (error) throw new AuthFailedError(error.message);
+      if (error) throw new AuthFailedError(mapSupabaseAuthError(error.message));
       if (!data.user?.id || !data.session?.access_token || !data.session?.refresh_token) {
         throw new AuthFailedError("Login did not return a complete auth session.");
       }
@@ -201,7 +211,7 @@ export function createSupabaseAuthService(): AuthService {
     async refresh(refreshToken) {
       const client = getSupabaseAuthClient();
       const { data, error } = await client.auth.refreshSession({ refresh_token: refreshToken });
-      if (error) throw new AuthFailedError(error.message);
+      if (error) throw new AuthFailedError(mapSupabaseAuthError(error.message));
       if (!data.user?.id || !data.session?.access_token || !data.session?.refresh_token) {
         throw new AuthFailedError("Refresh did not return a complete auth session.");
       }
@@ -250,7 +260,7 @@ export function createLocalAuthService(users = new Map<string, LocalUser>()): Au
 }
 
 export function createDefaultAuthService(): AuthService {
-  if (isSupabaseAuthConfigured()) {
+  if (useSupabaseAuth()) {
     return createSupabaseAuthService();
   }
   return createLocalAuthService();

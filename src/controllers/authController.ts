@@ -1,6 +1,6 @@
 import type { Request, Response } from "express";
 import type { AuthenticatedRequest } from "../auth/authMiddleware";
-import { isSupabaseAuthConfigured } from "../auth/supabaseAccessTokenUser";
+import { useSupabaseAuth } from "../auth/supabaseAccessTokenUser";
 import { hasDatabase } from "../db/pool";
 import {
   AuthFailedError,
@@ -27,7 +27,7 @@ function parseOrgType(value: unknown): OrgType | null {
 }
 
 function requirePersistentDbForSupabase(res: Response): boolean {
-  if (isSupabaseAuthConfigured() && !hasDatabase()) {
+  if (useSupabaseAuth() && !hasDatabase()) {
     res.status(503).json({
       error: "service_unavailable",
       message:

@@ -20,3 +20,9 @@ export async function getUserFromSupabaseAccessToken(accessToken: string): Promi
 export function isSupabaseAuthConfigured(): boolean {
   return Boolean(process.env.SUPABASE_URL?.trim() && process.env.SUPABASE_ANON_KEY?.trim());
 }
+
+/** True when Supabase keys are set and local auth is not forced for development. */
+export function useSupabaseAuth(): boolean {
+  if (process.env.FORCE_LOCAL_AUTH === "true") return false;
+  return isSupabaseAuthConfigured();
+}
